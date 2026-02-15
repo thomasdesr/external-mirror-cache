@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/coreos/go-systemd/v22/activation"
 	"github.com/coreos/go-systemd/v22/daemon"
@@ -103,7 +103,7 @@ func run() error {
 	s3Cache := &s3HTTPCache{
 		s3c:    s3c,
 		s3pc:   s3.NewPresignClient(s3c),
-		s3u:    manager.NewUploader(s3c),
+		s3u:    transfermanager.New(s3c),
 		bucket: *bucket,
 		prefix: *prefix,
 	}

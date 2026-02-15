@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
 
@@ -20,7 +20,7 @@ import (
 type s3HTTPCache struct {
 	s3c  *s3.Client
 	s3pc *s3.PresignClient
-	s3u  *manager.Uploader
+	s3u  *transfermanager.Client
 
 	bucket string
 	prefix string
@@ -88,17 +88,17 @@ func (c *s3HTTPCache) Put(ctx context.Context, url *url.URL, headers http.Header
 		return "", errorutil.Wrapf(err, "headerToMetadata(%v)", headers)
 	}
 
-	resp, err := c.s3u.Upload(ctx, &s3.PutObjectInput{
+	resp, err := c.s3u.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket:   aws.String(c.bucket),
 		Key:      aws.String(objectPath),
 		Body:     body,
 		Metadata: metadata,
 	})
 	if err != nil {
-		return "", errorutil.Wrapf(err, "Upload(%s, %s)", c.bucket, objectPath)
+		return "", errorutil.Wrapf(err, "UploadObject(%s, %s)", c.bucket, objectPath)
 	}
 
-	return resp.Location, nil
+	return aws.ToString(resp.Location), nil
 }
 
 func (c *s3HTTPCache) s3PathFor(u *url.URL) string {
