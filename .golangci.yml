@@ -18,7 +18,7 @@ linters:
     - nonamedreturns   # Named returns are useful for docs/defer
     - testpackage      # Forces _test package (can't test unexported)
     - paralleltest     # Forces t.Parallel() everywhere
-    - wsl              # Deprecated, using wsl_v5
+    - wsl              # Deprecated in golangci-lint v2, using wsl_v5
 
     # Style preferences
     - noinlineerr      # Prefer if-scoped errors even with shadowing
