@@ -32,9 +32,6 @@ linters:
       keywords:
         - TKTK
 
-    goimports:
-      local-prefixes: github.com/thomasdesr/external-mirror-cache
-
     cyclop:
       max-complexity: 15
 
@@ -68,3 +65,10 @@ linters:
         linters:
           - staticcheck
         text: SA5011
+
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes: github.com/thomasdesr/external-mirror-cache
