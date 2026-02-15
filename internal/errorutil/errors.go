@@ -1,4 +1,4 @@
-// Errorutil implements the Wrap and Wrapf functions from github.com/pkg/errors by
+// Package errorutil implements the Wrap and Wrapf functions from github.com/pkg/errors by
 // using fmt.Errorf.
 package errorutil
 

@@ -33,7 +33,7 @@ func (c *fakeCache) Head(ctx context.Context, u *url.URL) (http.Header, error) {
 
 	entry, ok := c.entries[u.String()]
 	if !ok {
-		return nil, nil
+		return nil, nil //nolint:nilnil // cache interface contract
 	}
 
 	return entry.headers.Clone(), nil

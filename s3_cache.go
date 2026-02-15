@@ -37,7 +37,7 @@ func (c *s3HTTPCache) Head(ctx context.Context, url *url.URL) (http.Header, erro
 		return c.head(ctx, url)
 	})
 
-	return result, err
+	return result, err //nolint:wrapcheck // error already wrapped in c.head
 }
 
 func (c *s3HTTPCache) head(ctx context.Context, url *url.URL) (http.Header, error) {
@@ -52,7 +52,7 @@ func (c *s3HTTPCache) head(ctx context.Context, url *url.URL) (http.Header, erro
 		// time.
 		var ae smithy.APIError
 		if errors.As(err, &ae) && ae.ErrorCode() == "NotFound" {
-			return nil, nil
+			return nil, nil //nolint:nilnil // nil,nil is the cache interface's "not found" contract
 		}
 
 		// Otherwise hand back the error

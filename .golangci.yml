@@ -26,6 +26,7 @@ linters:
     - ireturn          # Returning interfaces is valid for testability
     - funcorder        # Prefer caller-first ordering over export-first grouping
 
+
   settings:
     godox:
       keywords:
@@ -34,9 +35,36 @@ linters:
     goimports:
       local-prefixes: github.com/thomasdesr/external-mirror-cache
 
+    cyclop:
+      max-complexity: 15
+
+    funlen:
+      lines: 90
+
+    lll:
+      line-length: 140
+
     nolintlint:
       require-explanation: true
       require-specific: true
 
-exclusions:
-  warn-unused: true
+  exclusions:
+    warn-unused: true
+    rules:
+      - path: '(.+)_test\.go'
+        linters:
+          - bodyclose
+          - cyclop
+          - errcheck
+          - funlen
+          - gosec
+          - noctx
+          - wrapcheck
+      - path: '(.+)_test\.go'
+        linters:
+          - revive
+        text: unused-parameter
+      - path: '(.+)_test\.go'
+        linters:
+          - staticcheck
+        text: SA5011

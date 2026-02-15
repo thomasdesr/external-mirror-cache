@@ -33,11 +33,11 @@ func genHTTPDate() *rapid.Generator[string] {
 		month := rapid.SampledFrom(months).Draw(t, "month")
 		year := rapid.IntRange(2000, 2030).Draw(t, "year")
 		hour := rapid.IntRange(0, 23).Draw(t, "hour")
-		min := rapid.IntRange(0, 59).Draw(t, "min")
+		minute := rapid.IntRange(0, 59).Draw(t, "min")
 		sec := rapid.IntRange(0, 59).Draw(t, "sec")
 
 		return fmt.Sprintf("%s, %02d %s %d %02d:%02d:%02d GMT",
-			day, date, month, year, hour, min, sec)
+			day, date, month, year, hour, minute, sec)
 	})
 }
 

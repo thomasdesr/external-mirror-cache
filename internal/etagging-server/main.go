@@ -1,7 +1,8 @@
+// Package main provides a test file server with auto-generated ETags.
 package main
 
 import (
-	"crypto/sha1"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
 	"log"
@@ -10,6 +11,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"time"
+
+	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
 )
 
 const bindAddress = "localhost:8000"
@@ -52,19 +55,19 @@ func withEtag(next http.Handler) http.Handler {
 func generateEtag(path string) (string, error) {
 	absPath, err := filepath.Abs("./" + path)
 	if err != nil {
-		return "", err
+		return "", errorutil.Wrapf(err, "abs path %s", path)
 	}
 
 	fileInfo, err := os.Stat(absPath)
 	if err != nil {
-		return "", err
+		return "", errorutil.Wrapf(err, "stat %s", absPath)
 	}
 
 	etagBytes := make([]byte, 0, binary.MaxVarintLen64*2)
 	etagBytes = binary.AppendVarint(etagBytes, fileInfo.ModTime().UnixNano())
 	etagBytes = binary.AppendVarint(etagBytes, fileInfo.Size())
 
-	hash := sha1.Sum(etagBytes)
+	hash := sha256.Sum256(etagBytes)
 
 	return hex.EncodeToString(hash[:]), nil
 }

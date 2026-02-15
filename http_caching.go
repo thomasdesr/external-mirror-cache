@@ -12,11 +12,11 @@ import (
 func injectCacheHeadersIntoRequest(req *http.Request, cachedHeaders http.Header) {
 	etag := cachedHeaders.Get("etag")
 	if etag != "" && req.Header.Get("etag") == "" {
-		req.Header.Set("if-none-match", etag)
+		req.Header.Set("If-None-Match", etag)
 	}
 
-	lastModified := cachedHeaders.Get("last-modified")
-	if lastModified != "" && req.Header.Get("last-modified") == "" {
-		req.Header.Set("if-modified-since", lastModified)
+	lastModified := cachedHeaders.Get("Last-Modified")
+	if lastModified != "" && req.Header.Get("Last-Modified") == "" {
+		req.Header.Set("If-Modified-Since", lastModified)
 	}
 }

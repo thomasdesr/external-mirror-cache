@@ -14,6 +14,8 @@ import (
 	"github.com/thomasdesr/external-mirror-cache/internal/singleflight"
 )
 
+var errInvalidPath = errors.New("invalid path")
+
 // upstreamError represents an HTTP error response from upstream.
 // This allows relaying the original status code to clients.
 type upstreamError struct {
@@ -60,6 +62,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// All callers (including leader) redirect to the cached content.
 	// Use detached context so client disconnects don't abort fetches
 	// that other singleflight waiters depend on.
+	//nolint:contextcheck // intentional detached context, see comment above
 	presignedURL, err, _ := m.uploadGroup.Do(target.String(), func() (string, error) {
 		return m.fetchAndCache(context.WithoutCancel(r.Context()), target)
 	})
@@ -108,18 +111,19 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 		if cachedHeaders != nil && m.fallback.ShouldFallback(err, 0) {
 			log.Printf("upstream error for %s, serving stale: %v", target, err)
 
-			return m.cache.GetPresignedURL(ctx, target)
+			return m.presign(ctx, target)
 		}
 
 		return "", errorutil.Wrapf(err, "fetch %s (no cache available)", target)
 	}
-	defer resp.Body.Close()
+
+	defer resp.Body.Close() //nolint:errcheck // best-effort close
 
 	// 304 Not Modified - content already cached
 	if resp.StatusCode == http.StatusNotModified {
 		log.Printf("Upstream returned 304 for %s, using cached content", target)
 
-		return m.cache.GetPresignedURL(ctx, target)
+		return m.presign(ctx, target)
 	}
 
 	// Non-200 responses - check fallback policy
@@ -127,7 +131,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 		if cachedHeaders != nil && m.fallback.ShouldFallback(nil, resp.StatusCode) {
 			log.Printf("upstream %d for %s, serving stale", resp.StatusCode, target)
 
-			return m.cache.GetPresignedURL(ctx, target)
+			return m.presign(ctx, target)
 		}
 
 		return "", &upstreamError{StatusCode: resp.StatusCode, URL: target.String()}
@@ -141,7 +145,16 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 
 	log.Printf("Cached %s", target)
 
-	return m.cache.GetPresignedURL(ctx, target)
+	return m.presign(ctx, target)
+}
+
+func (m *cacheMiddleware) presign(ctx context.Context, target *url.URL) (string, error) {
+	u, err := m.cache.GetPresignedURL(ctx, target)
+	if err != nil {
+		return "", errorutil.Wrapf(err, "presign %s", target)
+	}
+
+	return u, nil
 }
 
 // parseTargetURL extracts the upstream URL from the request path.
@@ -151,7 +164,7 @@ func parseTargetURL(path, rawQuery string) (*url.URL, error) {
 	parts := strings.SplitN(path, "/", 2)
 
 	if len(parts) != 2 {
-		return nil, fmt.Errorf("invalid path: %s", path)
+		return nil, errorutil.Wrapf(errInvalidPath, "path %q", path)
 	}
 
 	return &url.URL{
