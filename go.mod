@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.18.25
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.11.67
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.33.1
-	github.com/aws/smithy-go v1.13.5
+	github.com/aws/smithy-go v1.24.0
 	github.com/coreos/go-systemd/v22 v22.7.0
 	golang.org/x/sync v0.19.0
 	pgregory.net/rapid v1.2.0
