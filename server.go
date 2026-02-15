@@ -37,17 +37,20 @@ type cacheMiddleware struct {
 func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/health" {
 		w.WriteHeader(http.StatusOK)
+
 		return
 	}
 
 	if r.Method != http.MethodGet {
 		http.Error(w, "Only GET requests are supported", http.StatusMethodNotAllowed)
+
 		return
 	}
 
 	target, err := parseTargetURL(r.URL.Path, r.URL.RawQuery)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("Invalid request: %s", err), http.StatusBadRequest)
+
 		return
 	}
 
@@ -62,12 +65,14 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		log.Printf("Failed to fetch and cache: %v", err)
+
 		var ue *upstreamError
 		if errors.As(err, &ue) {
 			http.Error(w, http.StatusText(ue.StatusCode), ue.StatusCode)
 		} else {
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		}
+
 		return
 	}
 
@@ -81,26 +86,31 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	cachedHeaders, err := m.cache.Head(ctx, target)
 	if err != nil {
 		log.Println("Didn't find cached headers for", target, ":", err)
+
 		cachedHeaders = nil
 	}
 
 	// Build upstream request
-	req, err := http.NewRequestWithContext(ctx, "GET", target.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
 	if err != nil {
 		return "", errorutil.Wrapf(err, "create request for %s", target)
 	}
+
 	if cachedHeaders != nil {
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
 	}
 
 	// Fetch from upstream
 	log.Printf("Fetching %s", target)
+
 	resp, err := m.client.Do(req)
 	if err != nil {
 		if cachedHeaders != nil && m.fallback.ShouldFallback(err, 0) {
 			log.Printf("upstream error for %s, serving stale: %v", target, err)
+
 			return m.cache.GetPresignedURL(ctx, target)
 		}
+
 		return "", errorutil.Wrapf(err, "fetch %s (no cache available)", target)
 	}
 	defer resp.Body.Close()
@@ -108,6 +118,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	// 304 Not Modified - content already cached
 	if resp.StatusCode == http.StatusNotModified {
 		log.Printf("Upstream returned 304 for %s, using cached content", target)
+
 		return m.cache.GetPresignedURL(ctx, target)
 	}
 
@@ -115,8 +126,10 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	if resp.StatusCode != http.StatusOK {
 		if cachedHeaders != nil && m.fallback.ShouldFallback(nil, resp.StatusCode) {
 			log.Printf("upstream %d for %s, serving stale", resp.StatusCode, target)
+
 			return m.cache.GetPresignedURL(ctx, target)
 		}
+
 		return "", &upstreamError{StatusCode: resp.StatusCode, URL: target.String()}
 	}
 
@@ -127,11 +140,12 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	}
 
 	log.Printf("Cached %s", target)
+
 	return m.cache.GetPresignedURL(ctx, target)
 }
 
 // parseTargetURL extracts the upstream URL from the request path.
-// Path format: /<domain>/<path>
+// Path format: /<domain>/<path>.
 func parseTargetURL(path, rawQuery string) (*url.URL, error) {
 	path = strings.TrimPrefix(path, "/")
 	parts := strings.SplitN(path, "/", 2)

@@ -17,6 +17,7 @@ func genETag() *rapid.Generator[string] {
 		if isWeak {
 			return `W/"` + value + `"`
 		}
+
 		return `"` + value + `"`
 	})
 }
@@ -47,10 +48,10 @@ func TestInjectCacheHeaders_ETagAddsIfNoneMatch(t *testing.T) {
 		cachedHeaders := make(http.Header)
 		cachedHeaders.Set("etag", etag)
 
-		req, _ := http.NewRequest("GET", "http://example.com/file", nil)
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
 
-		got := req.Header.Get("if-none-match")
+		got := req.Header.Get("If-None-Match")
 		if got != etag {
 			t.Fatalf("expected If-None-Match %q, got %q", etag, got)
 		}
@@ -62,12 +63,12 @@ func TestInjectCacheHeaders_LastModifiedAddsIfModifiedSince(t *testing.T) {
 		lastMod := genHTTPDate().Draw(t, "lastModified")
 
 		cachedHeaders := make(http.Header)
-		cachedHeaders.Set("last-modified", lastMod)
+		cachedHeaders.Set("Last-Modified", lastMod)
 
-		req, _ := http.NewRequest("GET", "http://example.com/file", nil)
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
 
-		got := req.Header.Get("if-modified-since")
+		got := req.Header.Get("If-Modified-Since")
 		if got != lastMod {
 			t.Fatalf("expected If-Modified-Since %q, got %q", lastMod, got)
 		}
@@ -81,17 +82,18 @@ func TestInjectCacheHeaders_BothHeadersInjected(t *testing.T) {
 
 		cachedHeaders := make(http.Header)
 		cachedHeaders.Set("etag", etag)
-		cachedHeaders.Set("last-modified", lastMod)
+		cachedHeaders.Set("Last-Modified", lastMod)
 
-		req, _ := http.NewRequest("GET", "http://example.com/file", nil)
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
 
-		gotETag := req.Header.Get("if-none-match")
-		gotLastMod := req.Header.Get("if-modified-since")
+		gotETag := req.Header.Get("If-None-Match")
+		gotLastMod := req.Header.Get("If-Modified-Since")
 
 		if gotETag != etag {
 			t.Fatalf("expected If-None-Match %q, got %q", etag, gotETag)
 		}
+
 		if gotLastMod != lastMod {
 			t.Fatalf("expected If-Modified-Since %q, got %q", lastMod, gotLastMod)
 		}
@@ -106,12 +108,12 @@ func TestInjectCacheHeaders_SkipsIfRequestHasETagHeader(t *testing.T) {
 		cachedHeaders := make(http.Header)
 		cachedHeaders.Set("etag", cachedETag)
 
-		req, _ := http.NewRequest("GET", "http://example.com/file", nil)
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 		req.Header.Set("etag", existingETag)
 
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
 
-		got := req.Header.Get("if-none-match")
+		got := req.Header.Get("If-None-Match")
 		if got != "" {
 			t.Fatalf("expected If-None-Match to be empty when request has ETag, got %q", got)
 		}
@@ -121,13 +123,14 @@ func TestInjectCacheHeaders_SkipsIfRequestHasETagHeader(t *testing.T) {
 func TestInjectCacheHeaders_EmptyCachedHeaders(t *testing.T) {
 	cachedHeaders := make(http.Header)
 
-	req, _ := http.NewRequest("GET", "http://example.com/file", nil)
+	req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 	injectCacheHeadersIntoRequest(req, cachedHeaders)
 
-	if req.Header.Get("if-none-match") != "" {
+	if req.Header.Get("If-None-Match") != "" {
 		t.Fatal("If-None-Match should not be set for empty cached headers")
 	}
-	if req.Header.Get("if-modified-since") != "" {
+
+	if req.Header.Get("If-Modified-Since") != "" {
 		t.Fatal("If-Modified-Since should not be set for empty cached headers")
 	}
 }
@@ -139,21 +142,22 @@ func TestInjectCacheHeaders_Idempotent(t *testing.T) {
 
 		cachedHeaders := make(http.Header)
 		cachedHeaders.Set("etag", etag)
-		cachedHeaders.Set("last-modified", lastMod)
+		cachedHeaders.Set("Last-Modified", lastMod)
 
-		req, _ := http.NewRequest("GET", "http://example.com/file", nil)
-
-		injectCacheHeadersIntoRequest(req, cachedHeaders)
-		firstIfNoneMatch := req.Header.Get("if-none-match")
-		firstIfModifiedSince := req.Header.Get("if-modified-since")
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
-		secondIfNoneMatch := req.Header.Get("if-none-match")
-		secondIfModifiedSince := req.Header.Get("if-modified-since")
+		firstIfNoneMatch := req.Header.Get("If-None-Match")
+		firstIfModifiedSince := req.Header.Get("If-Modified-Since")
+
+		injectCacheHeadersIntoRequest(req, cachedHeaders)
+		secondIfNoneMatch := req.Header.Get("If-None-Match")
+		secondIfModifiedSince := req.Header.Get("If-Modified-Since")
 
 		if firstIfNoneMatch != secondIfNoneMatch {
 			t.Fatalf("If-None-Match changed after second injection: %q -> %q", firstIfNoneMatch, secondIfNoneMatch)
 		}
+
 		if firstIfModifiedSince != secondIfModifiedSince {
 			t.Fatalf("If-Modified-Since changed after second injection: %q -> %q", firstIfModifiedSince, secondIfModifiedSince)
 		}
@@ -169,7 +173,7 @@ func TestInjectCacheHeaders_PreservesOtherHeaders(t *testing.T) {
 		cachedHeaders := make(http.Header)
 		cachedHeaders.Set("etag", etag)
 
-		req, _ := http.NewRequest("GET", "http://example.com/file", nil)
+		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 		req.Header.Set(otherHeaderKey, otherHeaderValue)
 
 		injectCacheHeadersIntoRequest(req, cachedHeaders)

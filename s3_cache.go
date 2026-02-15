@@ -36,6 +36,7 @@ func (c *s3HTTPCache) Head(ctx context.Context, url *url.URL) (http.Header, erro
 	result, err, _ := c.headGroup.Do(key, func() (http.Header, error) {
 		return c.head(ctx, url)
 	})
+
 	return result, err
 }
 
@@ -105,5 +106,6 @@ func (c *s3HTTPCache) s3PathFor(u *url.URL) string {
 	if u.RawQuery != "" {
 		path += "?" + url.QueryEscape(u.RawQuery)
 	}
+
 	return path
 }

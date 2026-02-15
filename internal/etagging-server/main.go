@@ -25,6 +25,7 @@ func main() {
 
 	// Start server
 	log.Printf("Listening on %s", bindAddress)
+
 	err := server.ListenAndServeTLS("localhost.dev.pem", "localhost.dev-key.pem") // Certs generated using mkcert usually
 	if err != nil {
 		panic(err)

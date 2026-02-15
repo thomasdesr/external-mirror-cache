@@ -20,16 +20,20 @@ func (p FallbackPolicy) ShouldFallback(err error, statusCode int) bool {
 	if p.OnAnyError && (err != nil || (statusCode != http.StatusOK && statusCode != http.StatusNotModified)) {
 		return true
 	}
+
 	if err != nil && p.OnConnectionError && isConnectionError(err) {
 		return true
 	}
+
 	if statusCode >= 500 && statusCode <= 504 && p.On5xx {
 		return true
 	}
+
 	return false
 }
 
 func isConnectionError(err error) bool {
 	var netErr net.Error
+
 	return err != nil && errors.As(err, &netErr)
 }

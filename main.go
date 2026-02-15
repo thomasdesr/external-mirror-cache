@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
 	"net"
@@ -23,6 +24,7 @@ func envDefault(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
 	}
+
 	return fallback
 }
 
@@ -56,14 +58,18 @@ func main() {
 	// proxy; AWS SDK traffic (S3, IMDS) uses the default transport directly.
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
+
 	if *egressProxy != "" {
 		proxyURL, err := url.Parse(*egressProxy)
 		if err != nil {
 			log.Fatalf("invalid --egress-proxy URL: %v", err)
 		}
+
 		transport.Proxy = http.ProxyURL(proxyURL)
+
 		log.Printf("Upstream requests proxied via %s", *egressProxy)
 	}
+
 	transport.DialContext = (&net.Dialer{
 		Timeout: 10 * time.Second,
 	}).DialContext
@@ -76,6 +82,7 @@ func main() {
 		Timeout:   5 * time.Minute,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			log.Println("Following redirect:", req.URL)
+
 			return nil
 		},
 	}
@@ -120,16 +127,21 @@ func getListener(addr string) (net.Listener, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	if len(listeners) > 0 {
 		log.Println("Using socket-activated listener")
+
 		return listeners[0], nil
 	}
+
 	log.Printf("Listening on %s", addr)
+
 	return net.Listen("tcp", addr)
 }
 
 func runServer(ctx context.Context, srv *http.Server, ln net.Listener) error {
 	serverErrors := make(chan error, 1)
+
 	go func() {
 		serverErrors <- srv.Serve(ln)
 	}()
@@ -138,7 +150,7 @@ func runServer(ctx context.Context, srv *http.Server, ln net.Listener) error {
 
 	select {
 	case err := <-serverErrors:
-		if err != nil && err != http.ErrServerClosed {
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 	case <-ctx.Done():

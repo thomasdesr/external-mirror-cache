@@ -25,11 +25,11 @@ func genHeader() *rapid.Generator[http.Header] {
 		h := make(http.Header)
 		numKeys := rapid.IntRange(0, 10).Draw(t, "numKeys")
 
-		for i := 0; i < numKeys; i++ {
+		for range numKeys {
 			key := genHeaderKey().Draw(t, "key")
 			numValues := rapid.IntRange(1, 5).Draw(t, "numValues")
 
-			for j := 0; j < numValues; j++ {
+			for range numValues {
 				value := genHeaderValue().Draw(t, "value")
 				h.Add(key, value)
 			}
@@ -145,6 +145,7 @@ func headersEqual(a, b http.Header) bool {
 		if len(aValues) != len(bValues) {
 			return false
 		}
+
 		for i, av := range aValues {
 			if av != bValues[i] {
 				return false

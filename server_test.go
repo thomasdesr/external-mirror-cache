@@ -35,6 +35,7 @@ func (c *fakeCache) Head(ctx context.Context, u *url.URL) (http.Header, error) {
 	if !ok {
 		return nil, nil
 	}
+
 	return entry.headers.Clone(), nil
 }
 
@@ -62,6 +63,7 @@ func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, bo
 func (c *fakeCache) get(u string) *cacheEntry {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+
 	return c.entries[u]
 }
 
@@ -84,12 +86,14 @@ func newTestServerWithFallback(upstream *httptest.Server, cache *fakeCache, fall
 // upstreamHostPath extracts just the host:port from a test server URL for use in proxy paths.
 func upstreamHostPath(upstream *httptest.Server, path string) string {
 	u, _ := url.Parse(upstream.URL)
+
 	return "/" + u.Host + path
 }
 
 func TestIntegration_CacheMissThenHit(t *testing.T) {
 	// Track upstream requests
 	var upstreamHits atomic.Int32
+
 	upstreamBody := "hello from upstream"
 
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -98,6 +102,7 @@ func TestIntegration_CacheMissThenHit(t *testing.T) {
 		// Check for conditional request headers
 		if r.Header.Get("If-None-Match") == `"test-etag"` {
 			w.WriteHeader(http.StatusNotModified)
+
 			return
 		}
 
@@ -108,6 +113,7 @@ func TestIntegration_CacheMissThenHit(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -125,11 +131,13 @@ func TestIntegration_CacheMissThenHit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
+
 	resp1.Body.Close()
 
 	if resp1.StatusCode != http.StatusSeeOther {
 		t.Fatalf("expected 303 redirect, got %d", resp1.StatusCode)
 	}
+
 	if upstreamHits.Load() != 1 {
 		t.Fatalf("expected 1 upstream hit, got %d", upstreamHits.Load())
 	}
@@ -137,13 +145,16 @@ func TestIntegration_CacheMissThenHit(t *testing.T) {
 	// Verify content was cached
 	upstreamURL, _ := url.Parse(upstream.URL)
 	cachedURL := "https://" + upstreamURL.Host + "/test.txt"
+
 	entry := cache.get(cachedURL)
 	if entry == nil {
 		t.Fatal("expected entry to be cached")
 	}
+
 	if entry.headers.Get("ETag") != `"test-etag"` {
 		t.Fatalf("expected cached ETag, got %q", entry.headers.Get("ETag"))
 	}
+
 	if string(entry.body) != upstreamBody {
 		t.Fatalf("expected cached body %q, got %q", upstreamBody, entry.body)
 	}
@@ -153,6 +164,7 @@ func TestIntegration_CacheMissThenHit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
+
 	resp2.Body.Close()
 
 	if resp2.StatusCode != http.StatusSeeOther {
@@ -167,6 +179,7 @@ func TestIntegration_CacheMissThenHit(t *testing.T) {
 
 func TestIntegration_SingleflightDeduplication(t *testing.T) {
 	var upstreamHits atomic.Int32
+
 	upstreamDelay := 100 * time.Millisecond
 
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -178,6 +191,7 @@ func TestIntegration_SingleflightDeduplication(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -192,18 +206,24 @@ func TestIntegration_SingleflightDeduplication(t *testing.T) {
 
 	// Launch concurrent requests
 	const numRequests = 5
+
 	var wg sync.WaitGroup
+
 	results := make(chan *http.Response, numRequests)
 
-	for i := 0; i < numRequests; i++ {
+	for range numRequests {
 		wg.Add(1)
+
 		go func() {
 			defer wg.Done()
+
 			resp, err := client.Get(proxy.URL + proxyPath)
 			if err != nil {
 				t.Errorf("request failed: %v", err)
+
 				return
 			}
+
 			results <- resp
 		}()
 	}
@@ -213,9 +233,11 @@ func TestIntegration_SingleflightDeduplication(t *testing.T) {
 
 	// All requests should get 303 redirects to cached content
 	var redirectCount int
+
 	for resp := range results {
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+
 		if resp.StatusCode == http.StatusSeeOther {
 			redirectCount++
 		} else {
@@ -245,6 +267,7 @@ func TestIntegration_UpstreamErrorRelaysStatusCode(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -263,10 +286,12 @@ func TestIntegration_UpstreamErrorRelaysStatusCode(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.path, func(t *testing.T) {
 			proxyPath := upstreamHostPath(upstream, tc.path)
+
 			resp, err := http.Get(proxy.URL + proxyPath)
 			if err != nil {
 				t.Fatalf("request failed: %v", err)
 			}
+
 			resp.Body.Close()
 
 			if resp.StatusCode != tc.expected {
@@ -289,6 +314,7 @@ func TestIntegration_MethodRestriction(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -298,10 +324,12 @@ func TestIntegration_MethodRestriction(t *testing.T) {
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {
 			req, _ := http.NewRequest(method, proxy.URL+proxyPath, nil)
+
 			resp, err := http.DefaultClient.Do(req)
 			if err != nil {
 				t.Fatalf("request failed: %v", err)
 			}
+
 			resp.Body.Close()
 
 			if resp.StatusCode != http.StatusMethodNotAllowed {
@@ -313,6 +341,7 @@ func TestIntegration_MethodRestriction(t *testing.T) {
 
 func TestIntegration_RangeRequestCachesFullFile(t *testing.T) {
 	var upstreamRangeHeader string
+
 	fullContent := "full file content here"
 
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -323,6 +352,7 @@ func TestIntegration_RangeRequestCachesFullFile(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -334,13 +364,14 @@ func TestIntegration_RangeRequestCachesFullFile(t *testing.T) {
 		},
 	}
 
-	req, _ := http.NewRequest("GET", proxy.URL+proxyPath, nil)
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
 	req.Header.Set("Range", "bytes=0-100")
 
 	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
+
 	resp.Body.Close()
 
 	// Should redirect to S3, not reject
@@ -356,10 +387,12 @@ func TestIntegration_RangeRequestCachesFullFile(t *testing.T) {
 	// Full content should be cached
 	upstreamURL, _ := url.Parse(upstream.URL)
 	cachedURL := "https://" + upstreamURL.Host + "/file.bin"
+
 	entry := cache.get(cachedURL)
 	if entry == nil {
 		t.Fatal("expected content to be cached")
 	}
+
 	if string(entry.body) != fullContent {
 		t.Errorf("expected full content cached, got %q", entry.body)
 	}
@@ -367,6 +400,7 @@ func TestIntegration_RangeRequestCachesFullFile(t *testing.T) {
 
 func TestIntegration_LastModifiedConditionalRequest(t *testing.T) {
 	var upstreamHits atomic.Int32
+
 	lastModified := "Wed, 21 Oct 2025 07:28:00 GMT"
 	upstreamBody := "content with last-modified"
 
@@ -376,6 +410,7 @@ func TestIntegration_LastModifiedConditionalRequest(t *testing.T) {
 		// Check for conditional request header
 		if r.Header.Get("If-Modified-Since") == lastModified {
 			w.WriteHeader(http.StatusNotModified)
+
 			return
 		}
 
@@ -386,6 +421,7 @@ func TestIntegration_LastModifiedConditionalRequest(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -402,6 +438,7 @@ func TestIntegration_LastModifiedConditionalRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
+
 	resp1.Body.Close()
 
 	if resp1.StatusCode != http.StatusSeeOther {
@@ -411,10 +448,12 @@ func TestIntegration_LastModifiedConditionalRequest(t *testing.T) {
 	// Verify Last-Modified was cached
 	upstreamURL, _ := url.Parse(upstream.URL)
 	cachedURL := "https://" + upstreamURL.Host + "/dated.txt"
+
 	entry := cache.get(cachedURL)
 	if entry == nil {
 		t.Fatal("expected entry to be cached")
 	}
+
 	if entry.headers.Get("Last-Modified") != lastModified {
 		t.Fatalf("expected cached Last-Modified %q, got %q", lastModified, entry.headers.Get("Last-Modified"))
 	}
@@ -424,6 +463,7 @@ func TestIntegration_LastModifiedConditionalRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
+
 	resp2.Body.Close()
 
 	if resp2.StatusCode != http.StatusSeeOther {
@@ -444,6 +484,7 @@ func TestIntegration_InvalidPathFormat(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -461,6 +502,7 @@ func TestIntegration_InvalidPathFormat(t *testing.T) {
 			if err != nil {
 				t.Fatalf("request failed: %v", err)
 			}
+
 			resp.Body.Close()
 
 			if resp.StatusCode != http.StatusBadRequest {
@@ -472,6 +514,7 @@ func TestIntegration_InvalidPathFormat(t *testing.T) {
 
 func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 	var upstreamHits atomic.Int32
+
 	upstreamStarted := make(chan struct{})
 	upstreamContinue := make(chan struct{})
 
@@ -485,6 +528,7 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -492,7 +536,7 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 
 	// Leader: will be cancelled mid-flight
 	leaderCtx, leaderCancel := context.WithCancel(context.Background())
-	leaderReq, _ := http.NewRequestWithContext(leaderCtx, "GET", proxy.URL+proxyPath, nil)
+	leaderReq, _ := http.NewRequestWithContext(leaderCtx, http.MethodGet, proxy.URL+proxyPath, nil)
 
 	// Follower: should succeed even if leader cancels
 	followerClient := &http.Client{
@@ -502,19 +546,25 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+
 	leaderResult := make(chan error, 1)
 	followerResult := make(chan *http.Response, 1)
 
 	// Start leader request
 	wg.Add(1)
+
 	go func() {
 		defer wg.Done()
+
 		resp, err := http.DefaultClient.Do(leaderReq)
 		if err != nil {
 			leaderResult <- err
+
 			return
 		}
+
 		resp.Body.Close()
+
 		leaderResult <- nil
 	}()
 
@@ -523,16 +573,21 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 
 	// Start follower request (will join singleflight)
 	wg.Add(1)
+
 	go func() {
 		defer wg.Done()
 		// Small delay to ensure follower joins the existing singleflight
 		time.Sleep(10 * time.Millisecond)
+
 		resp, err := followerClient.Get(proxy.URL + proxyPath)
 		if err != nil {
 			t.Errorf("follower request failed: %v", err)
+
 			followerResult <- nil
+
 			return
 		}
+
 		followerResult <- resp
 	}()
 
@@ -558,6 +613,7 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 	if followerResp == nil {
 		t.Fatal("follower should succeed even if leader cancels")
 	}
+
 	followerResp.Body.Close()
 
 	if followerResp.StatusCode != http.StatusSeeOther {
@@ -571,11 +627,14 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 }
 
 func TestIntegration_RedirectFollowing_CacheKeyIsOriginalURL(t *testing.T) {
-	var requestPaths []string
-	var mu sync.Mutex
+	var (
+		requestPaths []string
+		mu           sync.Mutex
+	)
 
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
+
 		requestPaths = append(requestPaths, r.URL.Path)
 		mu.Unlock()
 
@@ -590,6 +649,7 @@ func TestIntegration_RedirectFollowing_CacheKeyIsOriginalURL(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServer(upstream, cache)
 	defer proxy.Close()
 
@@ -605,6 +665,7 @@ func TestIntegration_RedirectFollowing_CacheKeyIsOriginalURL(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
+
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusSeeOther {
@@ -615,6 +676,7 @@ func TestIntegration_RedirectFollowing_CacheKeyIsOriginalURL(t *testing.T) {
 	if len(requestPaths) != 2 {
 		t.Fatalf("expected 2 upstream requests (redirect followed), got %d: %v", len(requestPaths), requestPaths)
 	}
+
 	if requestPaths[0] != "/original" || requestPaths[1] != "/final" {
 		t.Fatalf("expected requests to /original then /final, got %v", requestPaths)
 	}
@@ -627,6 +689,7 @@ func TestIntegration_RedirectFollowing_CacheKeyIsOriginalURL(t *testing.T) {
 	if cache.get(originalCacheKey) == nil {
 		t.Error("expected content to be cached under original URL")
 	}
+
 	if cache.get(finalCacheKey) != nil {
 		t.Error("content should NOT be cached under redirect destination URL")
 	}
@@ -640,13 +703,16 @@ func TestIntegration_FallbackOn5xx_WithCache(t *testing.T) {
 		if count == 1 {
 			w.Header().Set("ETag", `"test-etag"`)
 			w.Write([]byte("original content"))
+
 			return
 		}
+
 		http.Error(w, "server error", http.StatusInternalServerError)
 	}))
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{On5xx: true})
 	defer proxy.Close()
 
@@ -663,6 +729,7 @@ func TestIntegration_FallbackOn5xx_WithCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
+
 	resp1.Body.Close()
 
 	if resp1.StatusCode != http.StatusSeeOther {
@@ -674,6 +741,7 @@ func TestIntegration_FallbackOn5xx_WithCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
+
 	resp2.Body.Close()
 
 	if resp2.StatusCode != http.StatusSeeOther {
@@ -688,6 +756,7 @@ func TestIntegration_FallbackOn5xx_WithoutCache_RelaysStatusCode(t *testing.T) {
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{On5xx: true})
 	defer proxy.Close()
 
@@ -697,6 +766,7 @@ func TestIntegration_FallbackOn5xx_WithoutCache_RelaysStatusCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
+
 	resp.Body.Close()
 
 	// When no cache available, relay the upstream status code
@@ -713,8 +783,10 @@ func TestIntegration_FallbackDisabled_RelaysStatusCode(t *testing.T) {
 		if count == 1 {
 			w.Header().Set("ETag", `"test-etag"`)
 			w.Write([]byte("original content"))
+
 			return
 		}
+
 		http.Error(w, "server error", http.StatusInternalServerError)
 	}))
 	defer upstream.Close()
@@ -737,6 +809,7 @@ func TestIntegration_FallbackDisabled_RelaysStatusCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
+
 	resp1.Body.Close()
 
 	// Second request: upstream 500, fallback disabled, relay upstream status
@@ -744,6 +817,7 @@ func TestIntegration_FallbackDisabled_RelaysStatusCode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
+
 	resp2.Body.Close()
 
 	if resp2.StatusCode != http.StatusInternalServerError {
@@ -759,13 +833,16 @@ func TestIntegration_FallbackOnAnyError_Covers4xx(t *testing.T) {
 		if count == 1 {
 			w.Header().Set("ETag", `"test-etag"`)
 			w.Write([]byte("original content"))
+
 			return
 		}
+
 		http.Error(w, "not found", http.StatusNotFound)
 	}))
 	defer upstream.Close()
 
 	cache := newFakeCache()
+
 	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{OnAnyError: true})
 	defer proxy.Close()
 
@@ -782,6 +859,7 @@ func TestIntegration_FallbackOnAnyError_Covers4xx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
+
 	resp1.Body.Close()
 
 	// Second request: upstream 404, OnAnyError should fallback to stale
@@ -789,6 +867,7 @@ func TestIntegration_FallbackOnAnyError_Covers4xx(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
+
 	resp2.Body.Close()
 
 	if resp2.StatusCode != http.StatusSeeOther {
@@ -806,6 +885,7 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	}))
 
 	cache := newFakeCache()
+
 	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{OnConnectionError: true})
 	defer proxy.Close()
 
@@ -822,6 +902,7 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
+
 	resp1.Body.Close()
 
 	if resp1.StatusCode != http.StatusSeeOther {
@@ -836,6 +917,7 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
+
 	resp2.Body.Close()
 
 	if resp2.StatusCode != http.StatusSeeOther {
