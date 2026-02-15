@@ -1,0 +1,42 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: all
+  disable:
+    # Require project-specific config to be useful
+    - depguard
+    - goheader
+
+    # Too pedantic / context-dependent
+    - exhaustruct      # Requires ALL struct fields initialized
+    - varnamelen       # Variable name length must match scope
+    - gochecknoglobals # No globals at all
+    - gochecknoinits   # No init() functions
+    - nonamedreturns   # Named returns are useful for docs/defer
+    - testpackage      # Forces _test package (can't test unexported)
+    - paralleltest     # Forces t.Parallel() everywhere
+    - wsl              # Deprecated, using wsl_v5
+
+    # Style preferences
+    - noinlineerr      # Prefer if-scoped errors even with shadowing
+    - mnd              # File permissions and arg counts are self-documenting
+    - ireturn          # Returning interfaces is valid for testability
+    - funcorder        # Prefer caller-first ordering over export-first grouping
+
+  settings:
+    godox:
+      keywords:
+        - TKTK
+
+    goimports:
+      local-prefixes: github.com/thomasdesr/external-mirror-cache
+
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+
+exclusions:
+  warn-unused: true
