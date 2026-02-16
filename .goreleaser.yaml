@@ -17,7 +17,7 @@ archives:
   - formats: [binary]
 
 signs:
-  - artifacts: archive
+  - artifacts: checksum
     cmd: cosign
     signature: "${artifact}.sigstore.json"
     args:
