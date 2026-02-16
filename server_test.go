@@ -212,11 +212,7 @@ func TestIntegration_SingleflightDeduplication(t *testing.T) {
 	results := make(chan *http.Response, numRequests)
 
 	for range numRequests {
-		wg.Add(1)
-
-		go func() {
-			defer wg.Done()
-
+		wg.Go(func() {
 			resp, err := client.Get(proxy.URL + proxyPath)
 			if err != nil {
 				t.Errorf("request failed: %v", err)
@@ -225,7 +221,7 @@ func TestIntegration_SingleflightDeduplication(t *testing.T) {
 			}
 
 			results <- resp
-		}()
+		})
 	}
 
 	wg.Wait()
@@ -551,11 +547,8 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 	followerResult := make(chan *http.Response, 1)
 
 	// Start leader request
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
-
+	wg.Go(func() {
 		resp, err := http.DefaultClient.Do(leaderReq)
 		if err != nil {
 			leaderResult <- err
@@ -566,16 +559,14 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 		resp.Body.Close()
 
 		leaderResult <- nil
-	}()
+	})
 
 	// Wait for upstream to receive the request (leader is now in-flight)
 	<-upstreamStarted
 
 	// Start follower request (will join singleflight)
-	wg.Add(1)
 
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		// Small delay to ensure follower joins the existing singleflight
 		time.Sleep(10 * time.Millisecond)
 
@@ -589,7 +580,7 @@ func TestIntegration_LeaderCancellation_FollowerStillSucceeds(t *testing.T) {
 		}
 
 		followerResult <- resp
-	}()
+	})
 
 	// Cancel leader's context while both are waiting
 	time.Sleep(20 * time.Millisecond)
