@@ -11,10 +11,17 @@ builds:
       - linux
     goarch:
       - arm64
+      - amd64
 
-archives:
-  - formats: [tar.gz]
-    name_template: "{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+signs:
+  - artifacts: binary
+    cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - "sign-blob"
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
 
 checksum:
   name_template: "checksums.txt"
