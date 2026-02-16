@@ -13,8 +13,11 @@ builds:
       - arm64
       - amd64
 
+archives:
+  - formats: [binary]
+
 signs:
-  - artifacts: binary
+  - artifacts: archive
     cmd: cosign
     signature: "${artifact}.sigstore.json"
     args:
