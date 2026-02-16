@@ -81,7 +81,7 @@ jobs:
       - name: GoReleaser snapshot
         uses: goreleaser/goreleaser-action@e435ccd777264be153ace6237001ef4d979d3a7a # v6
         with:
-          version: latest
+          version: "~> v2"
           args: release --snapshot --clean --skip=publish
 
       - name: Upload artifacts
