@@ -164,7 +164,7 @@ func parseTargetURL(path, rawQuery string) (*url.URL, error) {
 	parts := strings.SplitN(path, "/", 2)
 
 	if len(parts) != 2 {
-		return nil, errorutil.Wrapf(errInvalidPath, "path %q", path)
+		return nil, errorutil.Wrapf(errInvalidPath, "invalid path %q", path)
 	}
 
 	return &url.URL{

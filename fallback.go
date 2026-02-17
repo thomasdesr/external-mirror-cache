@@ -10,7 +10,7 @@ import (
 // instead of returning an error when upstream is unavailable.
 type FallbackPolicy struct {
 	OnConnectionError bool // timeouts, DNS failures, connection refused
-	On5xx             bool // HTTP 500/502/503/504 from upstream
+	On5xx             bool // HTTP 5xx responses from upstream
 	OnAnyError        bool // any non-200/304 response
 }
 
@@ -25,7 +25,7 @@ func (p FallbackPolicy) ShouldFallback(err error, statusCode int) bool {
 		return true
 	}
 
-	if statusCode >= 500 && statusCode <= 504 && p.On5xx {
+	if statusCode >= 500 && statusCode < 600 && p.On5xx {
 		return true
 	}
 
