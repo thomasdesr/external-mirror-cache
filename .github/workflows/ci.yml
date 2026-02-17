@@ -91,5 +91,5 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: snapshot-${{ github.sha }}
-          path: dist/mirror-cache_linux_*
+          path: dist/external-mirror-cache_linux_*
           retention-days: 7
