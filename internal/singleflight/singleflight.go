@@ -5,7 +5,7 @@ import "golang.org/x/sync/singleflight"
 
 // Group is a typed wrapper around singleflight.Group.
 type Group[T any] struct {
-	singleflight.Group
+	group singleflight.Group
 }
 
 // Do executes fn and returns its result. If multiple callers call Do with the
@@ -13,7 +13,7 @@ type Group[T any] struct {
 //
 //nolint:revive // error-return: matches stdlib singleflight.Group.Do signature
 func (g *Group[T]) Do(key string, fn func() (T, error)) (v T, err error, shared bool) {
-	untypedV, err, shared := g.Group.Do(key, func() (any, error) {
+	untypedV, err, shared := g.group.Do(key, func() (any, error) {
 		return fn()
 	})
 

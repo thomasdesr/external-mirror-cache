@@ -138,7 +138,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	}
 
 	// 200 OK - stream to cache
-	_, err = m.cache.Put(ctx, target, resp.Header, bufio.NewReader(resp.Body))
+	err = m.cache.Put(ctx, target, resp.Header, bufio.NewReader(resp.Body))
 	if err != nil {
 		return "", errorutil.Wrapf(err, "cache %s", target)
 	}

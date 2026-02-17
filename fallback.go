@@ -35,5 +35,5 @@ func (p FallbackPolicy) ShouldFallback(err error, statusCode int) bool {
 func isConnectionError(err error) bool {
 	var netErr net.Error
 
-	return err != nil && errors.As(err, &netErr)
+	return errors.As(err, &netErr)
 }

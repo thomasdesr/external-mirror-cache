@@ -14,7 +14,6 @@ import (
 	"github.com/aws/smithy-go"
 
 	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
-	"github.com/thomasdesr/external-mirror-cache/internal/singleflight"
 )
 
 type s3HTTPCache struct {
@@ -24,23 +23,11 @@ type s3HTTPCache struct {
 
 	bucket string
 	prefix string
-
-	headGroup singleflight.Group[http.Header]
 }
 
 // Head checks to see if the provided URL has been cached in S3 and if so
-// returns its original request's HTTP headers. Concurrent requests for the same
-// URL are deduplicated.
+// returns its original request's HTTP headers.
 func (c *s3HTTPCache) Head(ctx context.Context, url *url.URL) (http.Header, error) {
-	key := url.String()
-	result, err, _ := c.headGroup.Do(key, func() (http.Header, error) {
-		return c.head(ctx, url)
-	})
-
-	return result, err //nolint:wrapcheck // error already wrapped in c.head
-}
-
-func (c *s3HTTPCache) head(ctx context.Context, url *url.URL) (http.Header, error) {
 	s3Path := c.s3PathFor(url)
 
 	resp, err := c.s3c.HeadObject(ctx, &s3.HeadObjectInput{
@@ -55,7 +42,6 @@ func (c *s3HTTPCache) head(ctx context.Context, url *url.URL) (http.Header, erro
 			return nil, nil //nolint:nilnil // nil,nil is the cache interface's "not found" contract
 		}
 
-		// Otherwise hand back the error
 		return nil, errorutil.Wrapf(err, "HeadObject(%s, %s)", c.bucket, s3Path)
 	}
 
@@ -80,25 +66,25 @@ func (c *s3HTTPCache) GetPresignedURL(ctx context.Context, url *url.URL) (string
 
 // Put uploads the provided body to the appropriate path in S3 based on the
 // provided URL and attaches its headers as S3 Object metadata.
-func (c *s3HTTPCache) Put(ctx context.Context, url *url.URL, headers http.Header, body io.Reader) (string, error) {
+func (c *s3HTTPCache) Put(ctx context.Context, url *url.URL, headers http.Header, body io.Reader) error {
 	objectPath := c.s3PathFor(url)
 
 	metadata, err := headerToMetadata(headers)
 	if err != nil {
-		return "", errorutil.Wrapf(err, "headerToMetadata(%v)", headers)
+		return errorutil.Wrapf(err, "headerToMetadata(%v)", headers)
 	}
 
-	resp, err := c.s3u.UploadObject(ctx, &transfermanager.UploadObjectInput{
+	_, err = c.s3u.UploadObject(ctx, &transfermanager.UploadObjectInput{
 		Bucket:   aws.String(c.bucket),
 		Key:      aws.String(objectPath),
 		Body:     body,
 		Metadata: metadata,
 	})
 	if err != nil {
-		return "", errorutil.Wrapf(err, "UploadObject(%s, %s)", c.bucket, objectPath)
+		return errorutil.Wrapf(err, "UploadObject(%s, %s)", c.bucket, objectPath)
 	}
 
-	return aws.ToString(resp.Location), nil
+	return nil
 }
 
 func (c *s3HTTPCache) s3PathFor(u *url.URL) string {

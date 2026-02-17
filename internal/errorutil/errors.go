@@ -6,8 +6,7 @@ import "fmt"
 
 // Wrap annotates `err` with the provided `msg`.
 func Wrap(err error, msg string) error {
-	// TODO: This should probably return nil if err is nil
-	return fmt.Errorf("%v: %w", msg, err)
+	return fmt.Errorf("%s: %w", msg, err)
 }
 
 // Wrapf annotates `err` with the provided format string and arguments.

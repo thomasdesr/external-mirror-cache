@@ -17,5 +17,5 @@ type httpCache interface {
 	GetPresignedURL(ctx context.Context, url *url.URL) (string, error)
 
 	// Put stores the response body and headers for the given URL.
-	Put(ctx context.Context, url *url.URL, headers http.Header, body io.Reader) (string, error)
+	Put(ctx context.Context, url *url.URL, headers http.Header, body io.Reader) error
 }

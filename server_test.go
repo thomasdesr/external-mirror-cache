@@ -43,10 +43,10 @@ func (c *fakeCache) GetPresignedURL(ctx context.Context, u *url.URL) (string, er
 	return "http://fake-s3/" + u.Host + u.Path, nil
 }
 
-func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, body io.Reader) (string, error) {
+func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, body io.Reader) error {
 	data, err := io.ReadAll(body)
 	if err != nil {
-		return "", err
+		return err
 	}
 
 	c.mu.Lock()
@@ -57,7 +57,7 @@ func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, bo
 		body:    data,
 	}
 
-	return "http://fake-s3/" + u.Host + u.Path, nil
+	return nil
 }
 
 func (c *fakeCache) get(u string) *cacheEntry {
