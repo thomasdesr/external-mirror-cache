@@ -3,11 +3,11 @@ module github.com/thomasdesr/external-mirror-cache
 go 1.26.0
 
 require (
-	github.com/aws/aws-sdk-go-v2 v1.41.1
+	github.com/aws/aws-sdk-go-v2 v1.41.2
 	github.com/aws/aws-sdk-go-v2/config v1.32.7
 	github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager v0.1.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.96.0
-	github.com/aws/smithy-go v1.24.0
+	github.com/aws/smithy-go v1.24.1
 	github.com/coreos/go-systemd/v22 v22.7.0
 	golang.org/x/sync v0.19.0
 	pgregory.net/rapid v1.2.0
