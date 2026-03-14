@@ -4,16 +4,37 @@ Last verified: 2026-03-15
 
 ## Scope & Boundaries
 
-Mirror-cache is a **caching fetch proxy**: go upstream, get bytes, put them in S3, serve from S3. It is a composable layer in a larger stack, not a complete system.
+Mirror-cache is a **caching fetch proxy**: go upstream, get bytes, put them in S3, serve from S3. It is a composable layer in a larger stack, not a complete system. It composes via `http.RoundTripper` for outbound transport and plain HTTP for inbound.
+
+### In Scope
+
+**Transport: protocol adapters.** Self-contained units that know how to fetch from a specific upstream type. The default is plain HTTP GET. OCI is the first non-trivial adapter. Each adapter owns its protocol flow end-to-end: discovery, handshakes, retry logic, and deciding when credentials are needed. Adapters present a uniform `http.RoundTripper` interface to the core.
+
+**Storage.** Cache keys, metadata serialization, presigned URLs, TTL/eviction. Cache key strategy is adapter-owned -- the current default uses URL-only keys, but protocol adapters define their own keying based on what their protocol requires for correctness.
 
 **The litmus test:** "Does this serve getting bytes into S3?" If yes, in scope.
 
 ### Out of Scope
 
-- **Credential management** -- secrets live in Tokenizer (`github.com/superfly/tokenizer`), never in this process
+- **Credential management** -- secrets live in Tokenizer (`github.com/superfly/tokenizer`), never in this process. Protocol adapters decide *when* in their flow to invoke the shared Tokenizer client
 - **Client identity/auth** -- could be layered via middleware, but the core doesn't participate
-- **Content transformation** -- raw bytes only
+- **Content transformation** -- raw bytes only. Adapters may inspect content only when it's part of the fetch (e.g., parsing a manifest to discover what else to fetch)
 - **Egress policy** -- egress proxy layer's concern (e.g., Smokescreen)
+- **Upstream health monitoring** -- fetch on demand, serve stale on failure
+
+### Protocol Adapter Guidelines
+
+**Build an adapter when:**
+- Upstream requires a multi-step handshake to fetch (OCI token negotiation)
+- Credentials must be injected at a specific point in the protocol, not just on the top-level request
+- Caching correctness requires protocol knowledge (mutable metadata vs immutable artifacts, snapshot consistency)
+- The protocol has cache key requirements beyond the URL
+
+**Use the default (plain HTTP) when:** upstream is a simple HTTPS GET, optionally with credential header injection via the shared Tokenizer client.
+
+**Adapters must not:** hold credentials, implement client auth, or implement their own storage (use the shared `httpCache` interface).
+
+*Why adapters own credential routing (not a flat transport chain):* Different protocols need credentials at different points. OCI needs credentials on the token-fetch sub-request, not the registry request. A flat `tokenizerTransport -> ociAuthTransport -> http.Transport` chain can't express that -- and worse, an outer Tokenizer layer injecting `Authorization` headers would silently suppress OCI auth's challenge-response flow.
 
 ### Deliberate Policy Choices
 
@@ -47,6 +68,7 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 - `s3_metadata.go` - Serializes HTTP headers to/from S3 object metadata as JSON
 - `fallback.go` - `FallbackPolicy`: controls when stale cached content is served on upstream errors
 - `http_caching.go` - Injects conditional request headers from cached headers
+- `oci_auth.go` - OCI Bearer token auth transport. Intercepts 401 challenges from OCI registries (e.g., Docker Hub), fetches anonymous tokens, caches them with TTL, and retries. Uses singleflight to deduplicate concurrent token fetches. Proactive path reuses cached challenges to avoid discovery round-trips. Only activates for `/v2/` OCI paths; non-OCI requests and requests with existing Authorization headers pass through. Transport chain: `http.Client` -> `ociAuthTransport` -> `http.Transport`
 
 **Internal packages:**
 - `internal/reqlog` - Per-request structured logging: context helpers, request ID, HTTP middleware

@@ -79,9 +79,12 @@ func newTestServer(upstream *httptest.Server, cache *fakeCache) *httptest.Server
 }
 
 func newTestServerWithFallback(upstream *httptest.Server, cache *fakeCache, fallback FallbackPolicy) *httptest.Server {
+	upstreamClient := upstream.Client()
+	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
+
 	handler := &cacheMiddleware{
 		cache:    cache,
-		client:   upstream.Client(),
+		client:   upstreamClient,
 		fallback: fallback,
 	}
 
@@ -868,6 +871,340 @@ func TestIntegration_FallbackOnAnyError_Covers4xx(t *testing.T) {
 
 	if resp2.StatusCode != http.StatusSeeOther {
 		t.Errorf("expected 303 redirect (stale fallback on 404), got %d", resp2.StatusCode)
+	}
+}
+
+func TestIntegration_OCIAuth_TransparentTokenResolution(t *testing.T) {
+	// Track calls to the token server
+	var tokenEndpointCalls atomic.Int32
+
+	// Create token server that returns a valid token
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEndpointCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry server that returns 401 without Authorization, 200 with it
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with challenge pointing to local token server
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository:library/test:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: return success with ETag
+		w.Header().Set("ETag", `"manifest-etag"`)
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		w.Write([]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	// Client with no redirect following to inspect the response
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	// With ociAuthTransport wired in, the proxy should transparently resolve the challenge
+	// and return 303 (redirect to cached content), never exposing the 401 to the client
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	// Verify token endpoint was called exactly once
+	if tokenEndpointCalls.Load() != 1 {
+		t.Errorf("expected token endpoint to be called once, got %d calls", tokenEndpointCalls.Load())
+	}
+
+	// Verify content was cached with correct ETag
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cachedURL := "https://" + upstreamURL.Host + "/v2/library/test/manifests/latest"
+
+	entry := cache.get(cachedURL)
+	if entry == nil {
+		t.Fatal("expected manifest to be cached")
+	}
+
+	if entry.headers.Get("ETag") != `"manifest-etag"` {
+		t.Fatalf("expected cached ETag %q, got %q", `"manifest-etag"`, entry.headers.Get("ETag"))
+	}
+}
+
+func TestIntegration_DockerHubAuthPath_ForwardsClientAuth(t *testing.T) {
+	t.Skip("proxy-level Authorization forwarding not yet implemented; OCI transport-level bypass tested in oci_auth_test.go (AC3.6)")
+
+	// Create a local token server so upstream challenge doesn't reference external URLs
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	var receivedAuth string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		if receivedAuth == "" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+tokenServer.URL+`/token"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("authenticated content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	token := "Bearer dGVzdC10b2tlbg=="
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req.Header.Set("Authorization", token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	// Upstream should have received the Authorization header
+	if receivedAuth != token {
+		t.Errorf("expected upstream to receive Authorization %q, got %q", token, receivedAuth)
+	}
+
+	// Request should succeed (redirect to cached content)
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+}
+
+func TestIntegration_OCIAuth_CacheRevalidation(t *testing.T) {
+	// Track calls to the token server and upstream requests
+	var (
+		tokenEndpointCalls   atomic.Int32
+		upstreamRequestCount atomic.Int32
+	)
+
+	// Create token server that returns a valid token
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEndpointCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry server that requires auth
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequestCount.Add(1)
+
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with OCI Bearer challenge
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository:library/test:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: check for conditional request
+		if r.Header.Get("If-None-Match") == `"manifest-etag"` {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		// Return full manifest with ETag
+		w.Header().Set("ETag", `"manifest-etag"`)
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		w.Write([]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: initial fetch, populates cache
+	resp1, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	initialTokenCalls := tokenEndpointCalls.Load()
+	if initialTokenCalls != 1 {
+		t.Errorf("after first request: expected 1 token call, got %d", initialTokenCalls)
+	}
+
+	// Second request: should use cached token and send If-None-Match to upstream
+	resp2, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Token endpoint should still be called once (cached token reused)
+	// The transport may proactively discover/refresh tokens, but shouldn't do extra unnecessary calls
+	finalTokenCalls := tokenEndpointCalls.Load()
+	if finalTokenCalls > 1 {
+		t.Errorf("after second request: expected at most 1 token call (cached), got %d", finalTokenCalls)
+	}
+
+	// Verify upstream received conditional request on second call
+	// With singleflight + token caching:
+	// First request: 401 (no auth) → transport fetches token → 200 (with auth after token fetch)
+	// Second request: 304 (with auth + If-None-Match)
+	// Total: 3 upstream requests
+	if upstreamRequestCount.Load() != 3 {
+		t.Errorf("expected exactly 3 upstream requests (401, 200, 304), got %d", upstreamRequestCount.Load())
+	}
+}
+
+func TestIntegration_OCIAuth_DifferentRepositories(t *testing.T) {
+	// Track calls to the token server
+	var tokenEndpointCalls atomic.Int32
+
+	// Create token server that returns a valid token
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEndpointCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry server that requires auth
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with OCI Bearer challenge
+			// Different repositories have different scopes, so each requires separate token fetch
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository` + r.URL.Path + `:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: return manifest with ETag
+		w.Header().Set("ETag", `"manifest-etag"`)
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		w.Write([]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Request first repository
+	proxyPath1 := upstreamHostPath(upstream, "/v2/library/ubuntu/manifests/latest")
+
+	resp1, err := client.Get(proxy.URL + proxyPath1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	// Request second repository (different scope)
+	proxyPath2 := upstreamHostPath(upstream, "/v2/library/alpine/manifests/latest")
+
+	resp2, err := client.Get(proxy.URL + proxyPath2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Each repository has a different scope, so each triggers a separate token fetch
+	if tokenEndpointCalls.Load() != 2 {
+		t.Errorf("expected token endpoint to be called twice (once per scope), got %d calls", tokenEndpointCalls.Load())
+	}
+
+	// Verify both manifests were cached
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	cachedURL1 := "https://" + upstreamURL.Host + "/v2/library/ubuntu/manifests/latest"
+
+	entry1 := cache.get(cachedURL1)
+	if entry1 == nil {
+		t.Fatal("expected ubuntu manifest to be cached")
+	}
+
+	cachedURL2 := "https://" + upstreamURL.Host + "/v2/library/alpine/manifests/latest"
+
+	entry2 := cache.get(cachedURL2)
+	if entry2 == nil {
+		t.Fatal("expected alpine manifest to be cached")
 	}
 }
 
