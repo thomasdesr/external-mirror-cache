@@ -66,7 +66,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		logger := reqlog.FromContext(r.Context())
-		logger.Error("failed to fetch and cache", "error", err)
+		logger.Error("failed to fetch and cache", "target", target.String(), "error", err)
 
 		var ue *upstreamError
 		if errors.As(err, &ue) {
