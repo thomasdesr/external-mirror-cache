@@ -1095,52 +1095,102 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
 	}
 
-	// Parse log output and verify "fetching from upstream" and "cached upstream response" have target attribute
-	logLines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
-	foundFetchingLog := false
-	foundCachedLog := false
+	records := parseJSONLogLines(buf.Bytes())
+	assertLogMsgHasAttr(t, records, "fetching from upstream", "target")
+	assertLogMsgHasAttr(t, records, "cached upstream response", "target")
 
-	for _, line := range logLines {
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
+	// Second request: triggers conditional request, upstream returns 304
+	buf.Reset()
 
-		var logRecord map[string]any
-		if err := json.Unmarshal(line, &logRecord); err != nil {
-			continue
-		}
-
-		msg, ok := logRecord["msg"].(string)
-		if !ok {
-			continue
-		}
-
-		if msg == "fetching from upstream" {
-			foundFetchingLog = true
-
-			target, hasTarget := logRecord["target"].(string)
-			if !hasTarget || target == "" {
-				t.Error("expected 'target' attribute in 'fetching from upstream' log")
-			}
-		}
-
-		if msg == "cached upstream response" {
-			foundCachedLog = true
-
-			target, hasTarget := logRecord["target"].(string)
-			if !hasTarget || target == "" {
-				t.Error("expected 'target' attribute in 'cached upstream response' log")
-			}
-		}
+	resp, err = client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
 	}
 
-	if !foundFetchingLog {
-		t.Error("expected to find 'fetching from upstream' log")
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect on second request, got %d", resp.StatusCode)
 	}
 
-	if !foundCachedLog {
-		t.Error("expected to find 'cached upstream response' log")
+	records = parseJSONLogLines(buf.Bytes())
+	assertLogMsgHasAttr(t, records, "upstream returned 304, using cached content", "target")
+}
+
+// TestIntegration_FallbackLoggingAttributes verifies that fallback (stale-serving)
+// logs include target and status attributes.
+func TestIntegration_FallbackLoggingAttributes(t *testing.T) {
+	var buf bytes.Buffer
+
+	oldDefault := slog.Default()
+	defer slog.SetDefault(oldDefault)
+
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, opts)))
+
+	// Upstream returns 200 first, then 500
+	requestCount := 0
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.Header().Set("ETag", `"test-etag"`)
+			w.Write([]byte("good content"))
+
+			return
+		}
+
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	cacheHandler := &cacheMiddleware{
+		cache:  cache,
+		client: upstream.Client(),
+		fallback: FallbackPolicy{
+			On5xx: true,
+		},
 	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/fallback.txt")
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: cache miss, populates cache
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// Second request: upstream returns 502, should serve stale
+	buf.Reset()
+
+	resp, err = client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 (stale fallback redirect), got %d", resp.StatusCode)
+	}
+
+	records := parseJSONLogLines(buf.Bytes())
+	assertLogMsgHasAttr(t, records, "upstream error status, serving stale", "target")
+	assertLogMsgHasAttr(t, records, "upstream error status, serving stale", "status")
 }
 
 // TestIntegration_SingleflightLeaderFollowerRequestIDs verifies that singleflight leader and follower requests have distinct request_ids.
