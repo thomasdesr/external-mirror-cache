@@ -6,7 +6,8 @@ import (
 	"context"
 	"errors"
 	"flag"
-	"log"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -22,6 +23,7 @@ import (
 	"github.com/coreos/go-systemd/v22/daemon"
 
 	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
+	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 )
 
 func envDefault(key, fallback string) string {
@@ -39,6 +41,9 @@ var (
 
 	egressProxy = flag.String("egress-proxy", "", "HTTP CONNECT proxy for upstream requests (e.g. http://127.0.0.1:4750)")
 
+	logLevel = flag.String("log-level", envDefault("MIRROR_CACHE_LOG_LEVEL", "info"),
+		"log level: debug, info, warn, error (env: MIRROR_CACHE_LOG_LEVEL)")
+
 	staleOnConnectionError = flag.Bool("stale-on-connection-error", true, "serve stale content on connection errors (timeouts, DNS failures)")
 	staleOn5xx             = flag.Bool("stale-on-5xx", true, "serve stale content on upstream 5xx errors")
 	staleOnAnyError        = flag.Bool("stale-on-any-error", false, "serve stale content on any upstream error")
@@ -48,13 +53,18 @@ func main() {
 	flag.Parse()
 
 	if err := run(); err != nil {
-		log.Fatal(err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
 	}
 }
 
 var errBucketRequired = errors.New("--bucket or MIRROR_CACHE_BUCKET is required")
 
 func run() error {
+	if err := setupLogging(*logLevel); err != nil {
+		return err
+	}
+
 	if *bucket == "" {
 		return errBucketRequired
 	}
@@ -81,7 +91,7 @@ func run() error {
 
 		transport.Proxy = http.ProxyURL(proxyURL)
 
-		log.Printf("Upstream requests proxied via %s", *egressProxy)
+		slog.Info("upstream requests proxied via egress proxy", "proxy", *egressProxy)
 	}
 
 	transport.DialContext = (&net.Dialer{
@@ -95,7 +105,7 @@ func run() error {
 		Transport: transport,
 		Timeout:   5 * time.Minute,
 		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-			log.Println("Following redirect:", req.URL)
+			reqlog.FromContext(req.Context()).Debug("following redirect", "url", req.URL.String())
 
 			return nil
 		},
@@ -125,7 +135,7 @@ func run() error {
 	}
 
 	srv := &http.Server{
-		Handler:           handler,
+		Handler:           reqlog.Middleware(handler),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -136,7 +146,34 @@ func run() error {
 		return errorutil.Wrap(err, "server")
 	}
 
-	log.Println("Server stopped")
+	slog.Info("server stopped")
+
+	return nil
+}
+
+func setupLogging(levelStr string) error {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(levelStr)); err != nil {
+		return errorutil.Wrapf(err, "invalid log level %q", levelStr)
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+
+	var handler slog.Handler
+	if isTTY(os.Stderr) {
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	} else {
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	}
+
+	slog.SetDefault(slog.New(handler))
+
+	slog.Info("starting mirror-cache",
+		"bucket", *bucket,
+		"prefix", *prefix,
+		"listen", *listen,
+		"log_level", level.String(),
+	)
 
 	return nil
 }
@@ -148,12 +185,12 @@ func getListener(addr string) (net.Listener, error) {
 	}
 
 	if len(listeners) > 0 {
-		log.Println("Using socket-activated listener")
+		slog.Info("using socket-activated listener")
 
 		return listeners[0], nil
 	}
 
-	log.Printf("Listening on %s", addr)
+	slog.Info("listening", "addr", addr)
 
 	lc := net.ListenConfig{}
 
@@ -180,15 +217,24 @@ func runServer(ctx context.Context, srv *http.Server, ln net.Listener) error {
 			return err
 		}
 	case <-ctx.Done():
-		log.Println("Received shutdown signal, starting graceful shutdown")
+		slog.Info("received shutdown signal, starting graceful shutdown")
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
 
 		if err := srv.Shutdown(shutdownCtx); err != nil { //nolint:contextcheck // fresh context after signal
-			log.Printf("Server shutdown error: %v", err)
+			slog.Error("server shutdown error", "error", err)
 		}
 	}
 
 	return nil
+}
+
+func isTTY(f *os.File) bool {
+	info, err := f.Stat()
+	if err != nil {
+		return false
+	}
+
+	return info.Mode()&os.ModeCharDevice != 0
 }

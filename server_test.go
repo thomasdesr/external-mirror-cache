@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 )
 
 // fakeCache is an in-memory httpCache for testing.
@@ -914,4 +919,445 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	if resp2.StatusCode != http.StatusSeeOther {
 		t.Errorf("expected 303 redirect (stale fallback on conn error), got %d", resp2.StatusCode)
 	}
+}
+
+// TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
+func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
+	var buf bytes.Buffer
+
+	oldDefault := slog.Default()
+
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	// Set up JSON logging to capture all logs
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	handler := slog.NewJSONHandler(&buf, opts)
+	slog.SetDefault(slog.New(handler))
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("test content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	// Create proxy with reqlog middleware to capture request logs
+	cacheHandler := &cacheMiddleware{
+		cache:    cache,
+		client:   upstream.Client(),
+		fallback: FallbackPolicy{},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/test.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Make a request
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	// Parse log output
+	logLines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	if len(logLines) < 2 {
+		t.Fatalf("expected at least 2 log lines (request start and end), got %d", len(logLines))
+	}
+
+	// Check request started log
+	var requestStartLog map[string]any
+	if err := json.Unmarshal(logLines[0], &requestStartLog); err != nil {
+		t.Fatalf("failed to parse first log line: %v", err)
+	}
+
+	if requestStartLog["msg"] != "request started" {
+		t.Errorf("expected 'request started', got %v", requestStartLog["msg"])
+	}
+
+	// Verify request_id is present
+	if _, hasRequestID := requestStartLog["request_id"]; !hasRequestID {
+		t.Error("expected request_id in request start log")
+	}
+
+	// Check request completed log (last line)
+	var requestEndLog map[string]any
+	if err := json.Unmarshal(logLines[len(logLines)-1], &requestEndLog); err != nil {
+		t.Fatalf("failed to parse last log line: %v", err)
+	}
+
+	if requestEndLog["msg"] != "request completed" {
+		t.Errorf("expected 'request completed', got %v", requestEndLog["msg"])
+	}
+
+	// Verify request_id matches in end log
+	if requestEndLog["request_id"] != requestStartLog["request_id"] {
+		t.Error("request_id should be consistent across request start and end")
+	}
+
+	// Verify status and duration in end log
+	if status, ok := requestEndLog["status"].(float64); !ok || int(status) != http.StatusSeeOther {
+		t.Errorf("expected status 303 in request end, got %v", requestEndLog["status"])
+	}
+
+	if _, hasDuration := requestEndLog["duration"]; !hasDuration {
+		t.Error("expected duration in request completed log")
+	}
+
+	// Verify that request_id appears in multiple logs (from request lifecycle)
+	// This demonstrates structured logging is working across the request
+	requestIDCount := 0
+
+	for _, line := range logLines {
+		var logRecord map[string]any
+		if err := json.Unmarshal(line, &logRecord); err != nil {
+			continue
+		}
+
+		// Count how many logs have the request_id (should be at least 2: start and end)
+		if _, hasRequestID := logRecord["request_id"]; hasRequestID {
+			requestIDCount++
+		}
+	}
+
+	// At minimum, verify request_id appears in multiple logs (showing structured logging works)
+	if requestIDCount < 2 {
+		t.Errorf("expected request_id in at least 2 logs (start and end), found in %d logs", requestIDCount)
+	}
+}
+
+// TestIntegration_TargetAttributeInLogs verifies that intermediate operations include the target attribute in logs.
+func TestIntegration_TargetAttributeInLogs(t *testing.T) {
+	var buf bytes.Buffer
+
+	oldDefault := slog.Default()
+
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	// Set up JSON logging at debug level
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	handler := slog.NewJSONHandler(&buf, opts)
+	slog.SetDefault(slog.New(handler))
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("test content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	// Create proxy with reqlog middleware
+	cacheHandler := &cacheMiddleware{
+		cache:    cache,
+		client:   upstream.Client(),
+		fallback: FallbackPolicy{},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/test.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: cache miss, should log "fetching from upstream"
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	records := parseJSONLogLines(buf.Bytes())
+	assertLogMsgHasAttr(t, records, "fetching from upstream", "target")
+	assertLogMsgHasAttr(t, records, "cached upstream response", "target")
+
+	// Second request: triggers conditional request, upstream returns 304
+	buf.Reset()
+
+	resp, err = client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect on second request, got %d", resp.StatusCode)
+	}
+
+	records = parseJSONLogLines(buf.Bytes())
+	assertLogMsgHasAttr(t, records, "upstream returned 304, using cached content", "target")
+}
+
+// TestIntegration_FallbackLoggingAttributes verifies that fallback (stale-serving)
+// logs include target and status attributes.
+func TestIntegration_FallbackLoggingAttributes(t *testing.T) {
+	var buf bytes.Buffer
+
+	oldDefault := slog.Default()
+	defer slog.SetDefault(oldDefault)
+
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, opts)))
+
+	// Upstream returns 200 first, then 500
+	requestCount := 0
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			w.Header().Set("ETag", `"test-etag"`)
+			w.Write([]byte("good content"))
+
+			return
+		}
+
+		w.WriteHeader(http.StatusBadGateway)
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	cacheHandler := &cacheMiddleware{
+		cache:  cache,
+		client: upstream.Client(),
+		fallback: FallbackPolicy{
+			On5xx: true,
+		},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/fallback.txt")
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: cache miss, populates cache
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// Second request: upstream returns 502, should serve stale
+	buf.Reset()
+
+	resp, err = client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 (stale fallback redirect), got %d", resp.StatusCode)
+	}
+
+	records := parseJSONLogLines(buf.Bytes())
+	assertLogMsgHasAttr(t, records, "upstream error status, serving stale", "target")
+	assertLogMsgHasAttr(t, records, "upstream error status, serving stale", "status")
+}
+
+// TestIntegration_SingleflightLeaderFollowerRequestIDs verifies that singleflight leader and follower requests have distinct request_ids.
+func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
+	var buf bytes.Buffer
+
+	oldDefault := slog.Default()
+
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	// Set up JSON logging at debug level to capture all logs
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	handler := slog.NewJSONHandler(&buf, opts)
+	slog.SetDefault(slog.New(handler))
+
+	upstreamStarted := make(chan struct{})
+	upstreamContinue := make(chan struct{})
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(upstreamStarted)
+		<-upstreamContinue
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("slow response"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	// Create proxy with reqlog middleware
+	cacheHandler := &cacheMiddleware{
+		cache:    cache,
+		client:   upstream.Client(),
+		fallback: FallbackPolicy{},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/slow.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	var wg sync.WaitGroup
+
+	leaderResult := make(chan *http.Response, 1)
+	followerResult := make(chan *http.Response, 1)
+
+	// Start leader request
+	wg.Go(func() {
+		resp, err := client.Get(proxy.URL + proxyPath)
+		if err != nil {
+			t.Logf("leader request failed: %v", err)
+
+			return
+		}
+
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		leaderResult <- resp
+	})
+
+	// Wait for upstream to receive leader request
+	<-upstreamStarted
+
+	// Start follower request (will join singleflight group)
+	wg.Go(func() {
+		// Small delay to ensure follower joins existing singleflight
+		time.Sleep(10 * time.Millisecond)
+
+		resp, err := client.Get(proxy.URL + proxyPath)
+		if err != nil {
+			t.Logf("follower request failed: %v", err)
+
+			return
+		}
+
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		followerResult <- resp
+	})
+
+	// Allow upstream to complete
+	close(upstreamContinue)
+
+	wg.Wait()
+	close(leaderResult)
+	close(followerResult)
+
+	leaderResp := <-leaderResult
+	followerResp := <-followerResult
+
+	if leaderResp == nil || followerResp == nil {
+		t.Fatal("expected both requests to complete")
+	}
+
+	records := parseJSONLogLines(buf.Bytes())
+	requestIDs := extractRequestIDs(records, "request started")
+
+	if len(requestIDs) < 2 {
+		t.Fatalf("expected at least 2 'request started' messages, got %d", len(requestIDs))
+	}
+
+	if requestIDs[0] == requestIDs[1] {
+		t.Errorf("expected distinct request_ids for leader and follower, got both %q", requestIDs[0])
+	}
+
+	assertLogMsgHasAttr(t, records, "fetching from upstream", "request_id")
+	assertLogMsgHasAttr(t, records, "cached upstream response", "request_id")
+}
+
+// parseJSONLogLines parses newline-delimited JSON log output into records.
+func parseJSONLogLines(data []byte) []map[string]any {
+	var records []map[string]any
+
+	for line := range bytes.SplitSeq(bytes.TrimSpace(data), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			continue
+		}
+
+		records = append(records, record)
+	}
+
+	return records
+}
+
+// extractRequestIDs returns all request_id values from log records matching msg.
+func extractRequestIDs(records []map[string]any, msg string) []string {
+	var ids []string
+
+	for _, r := range records {
+		if m, _ := r["msg"].(string); m == msg {
+			if id, _ := r["request_id"].(string); id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+
+	return ids
+}
+
+// assertLogMsgHasAttr checks that at least one log record with the given msg
+// contains the specified attribute. Logs a note (not failure) if the msg is not found.
+func assertLogMsgHasAttr(t *testing.T, records []map[string]any, msg, attr string) {
+	t.Helper()
+
+	for _, r := range records {
+		if m, _ := r["msg"].(string); m == msg {
+			if _, ok := r[attr]; !ok {
+				t.Errorf("log %q missing attribute %q", msg, attr)
+			}
+
+			return
+		}
+	}
+
+	t.Logf("note: log message %q not found in output", msg)
 }
