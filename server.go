@@ -89,7 +89,6 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // If content is already cached and upstream returns 304, skips re-upload.
 func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accept string) (string, error) {
 	logger := reqlog.FromContext(ctx)
-
 	// Check cache for conditional request headers
 	cachedHeaders, err := m.cache.Head(ctx, key)
 	if err != nil {
