@@ -5,12 +5,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
+	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 	"github.com/thomasdesr/external-mirror-cache/internal/singleflight"
 )
 
@@ -56,8 +56,6 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println("Serving request:", r.URL.Path)
-
 	// Singleflight ensures only one request fetches from upstream.
 	// All callers (including leader) redirect to the cached content.
 	// Use detached context so client disconnects don't abort fetches
@@ -67,7 +65,8 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return m.fetchAndCache(context.WithoutCancel(r.Context()), target)
 	})
 	if err != nil {
-		log.Printf("Failed to fetch and cache: %v", err)
+		logger := reqlog.FromContext(r.Context())
+		logger.Error("failed to fetch and cache", "error", err)
 
 		var ue *upstreamError
 		if errors.As(err, &ue) {
@@ -85,10 +84,12 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // fetchAndCache fetches from upstream and caches to S3, returning the presigned URL.
 // If content is already cached and upstream returns 304, skips re-upload.
 func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (string, error) {
+	logger := reqlog.FromContext(ctx)
+
 	// Check cache for conditional request headers
 	cachedHeaders, err := m.cache.Head(ctx, target)
 	if err != nil {
-		log.Println("Didn't find cached headers for", target, ":", err)
+		logger.Warn("cache head error", "target", target.String(), "error", err)
 
 		cachedHeaders = nil
 	}
@@ -104,12 +105,12 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	}
 
 	// Fetch from upstream
-	log.Printf("Fetching %s", target)
+	logger.Debug("fetching from upstream", "target", target.String(), "has_cached", cachedHeaders != nil)
 
 	resp, err := m.client.Do(req)
 	if err != nil {
 		if cachedHeaders != nil && m.fallback.ShouldFallback(err, 0) {
-			log.Printf("upstream error for %s, serving stale: %v", target, err)
+			logger.Warn("upstream error, serving stale", "target", target.String(), "error", err)
 
 			return m.presign(ctx, target)
 		}
@@ -121,7 +122,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 
 	// 304 Not Modified - content already cached
 	if resp.StatusCode == http.StatusNotModified {
-		log.Printf("Upstream returned 304 for %s, using cached content", target)
+		logger.Info("upstream returned 304, using cached content", "target", target.String())
 
 		return m.presign(ctx, target)
 	}
@@ -129,7 +130,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	// Non-200 responses - check fallback policy
 	if resp.StatusCode != http.StatusOK {
 		if cachedHeaders != nil && m.fallback.ShouldFallback(nil, resp.StatusCode) {
-			log.Printf("upstream %d for %s, serving stale", resp.StatusCode, target)
+			logger.Warn("upstream error status, serving stale", "target", target.String(), "status", resp.StatusCode)
 
 			return m.presign(ctx, target)
 		}
@@ -143,7 +144,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 		return "", errorutil.Wrapf(err, "cache %s", target)
 	}
 
-	log.Printf("Cached %s", target)
+	logger.Debug("cached upstream response", "target", target.String())
 
 	return m.presign(ctx, target)
 }
