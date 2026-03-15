@@ -10,7 +10,7 @@ Mirror-cache is a **caching fetch proxy**: go upstream, get bytes, put them in S
 
 **Transport: protocol adapters.** Self-contained units that know how to fetch from a specific upstream type. The default is plain HTTP GET. OCI is the first non-trivial adapter. Each adapter owns its protocol flow end-to-end: discovery, handshakes, retry logic, and deciding when credentials are needed. Adapters present a uniform `http.RoundTripper` interface to the core.
 
-**Storage.** Cache keys, metadata serialization, presigned URLs, TTL/eviction. Cache key strategy is adapter-owned -- the current default uses URL-only keys, but protocol adapters define their own keying based on what their protocol requires for correctness.
+**Storage.** Cache keys, metadata serialization, presigned URLs, TTL/eviction. Cache keys are `CacheKey{URL, Variant}` pairs -- the core uses URL-only keys by default, but a pluggable `keyFunc` lets protocol adapters include request-derived data (e.g., Accept header) as a variant for correctness. Non-empty variants produce distinct S3 objects and distinct singleflight groups.
 
 **The litmus test:** "Does this serve getting bytes into S3?" If yes, in scope.
 
@@ -56,15 +56,18 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 **Request flow:**
 1. Client requests `/<domain>/<path>` (e.g., `/example.com/file.txt`)
 2. `reqlog.Middleware` assigns a request ID and structured logger to the context
-3. Server checks S3 for cached response headers (ETag, Last-Modified)
-4. If cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since`
-5. On 304 Not Modified: redirects client to S3 presigned URL
-6. On 200 OK: streams response to S3 cache, then redirects client
+3. `keyFunc` builds a `CacheKey` from the target URL and request (OCI paths include Accept header as variant; non-OCI paths use URL only)
+4. Server checks S3 for cached response headers (ETag, Last-Modified) using the `CacheKey`
+5. If cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since` (and Accept header if present)
+6. On 304 Not Modified: redirects client to S3 presigned URL
+7. On 200 OK: streams response to S3 cache, then redirects client
+
+Upstream redirects are followed before caching -- the cache key is the original requested URL (plus variant if applicable), not the final redirect destination.
 
 **Key components:**
-- `server.go` - HTTP handler (`cacheMiddleware`): parses `/<domain>/<path>`, checks S3 cache, fetches upstream with singleflight dedup, redirects to presigned S3 URLs
-- `cache.go` - `httpCache` interface: `Head`, `Put`, `GetPresignedURL`
-- `s3_cache.go` - S3 implementation of `httpCache`
+- `server.go` - Main HTTP handler (`cacheMiddleware`): parses `/<domain>/<path>` requests, builds a `CacheKey` via pluggable `keyFunc`, checks S3 cache, fetches upstream with singleflight dedup (keyed on `CacheKey.String()`), forwards Accept header to upstream, redirects clients to presigned S3 URLs. `ociAwareKeyFunc` includes Accept as the variant for `/v2/` OCI paths; non-OCI paths use URL-only keys
+- `cache.go` - `CacheKey` type (URL + Variant) and `httpCache` interface: `Head`, `Put`, `GetPresignedURL` (all take `CacheKey`)
+- `s3_cache.go` - S3 implementation of `httpCache`: stores responses and serves presigned URLs. S3 path is `<prefix>/<host>/<path>` for URL-only keys, with `//<variant>` appended for variant keys
 - `s3_metadata.go` - Serializes HTTP headers to/from S3 object metadata as JSON
 - `fallback.go` - `FallbackPolicy`: controls when stale cached content is served on upstream errors
 - `http_caching.go` - Injects conditional request headers from cached headers
