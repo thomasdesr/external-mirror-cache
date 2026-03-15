@@ -17,6 +17,12 @@ import (
 	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 )
 
+const (
+	ociImageIndexMediaType    = "application/vnd.oci.image.index.v1+json"
+	dockerManifestV2MediaType = "application/vnd.docker.distribution.manifest.v2+json"
+	testManifestETag          = `"manifest-etag"`
+)
+
 // fakeCache is an in-memory httpCache for testing.
 type fakeCache struct {
 	mu      sync.RWMutex
@@ -32,11 +38,11 @@ func newFakeCache() *fakeCache {
 	return &fakeCache{entries: make(map[string]*cacheEntry)}
 }
 
-func (c *fakeCache) Head(ctx context.Context, u *url.URL) (http.Header, error) {
+func (c *fakeCache) Head(ctx context.Context, key CacheKey) (http.Header, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	entry, ok := c.entries[u.String()]
+	entry, ok := c.entries[key.String()]
 	if !ok {
 		return nil, nil //nolint:nilnil // cache interface contract
 	}
@@ -44,11 +50,11 @@ func (c *fakeCache) Head(ctx context.Context, u *url.URL) (http.Header, error) {
 	return entry.headers.Clone(), nil
 }
 
-func (c *fakeCache) GetPresignedURL(ctx context.Context, u *url.URL) (string, error) {
-	return "http://fake-s3/" + u.Host + u.Path, nil
+func (c *fakeCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, error) {
+	return "http://fake-s3/" + key.URL.Host + key.URL.Path, nil
 }
 
-func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, body io.Reader) error {
+func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, body io.Reader) error {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -57,7 +63,7 @@ func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, bo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries[u.String()] = &cacheEntry{
+	c.entries[key.String()] = &cacheEntry{
 		headers: headers.Clone(),
 		body:    data,
 	}
@@ -79,10 +85,14 @@ func newTestServer(upstream *httptest.Server, cache *fakeCache) *httptest.Server
 }
 
 func newTestServerWithFallback(upstream *httptest.Server, cache *fakeCache, fallback FallbackPolicy) *httptest.Server {
+	upstreamClient := upstream.Client()
+	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
+
 	handler := &cacheMiddleware{
 		cache:    cache,
-		client:   upstream.Client(),
+		client:   upstreamClient,
 		fallback: fallback,
+		keyFunc:  ociAwareKeyFunc,
 	}
 
 	return httptest.NewServer(handler)
@@ -871,6 +881,471 @@ func TestIntegration_FallbackOnAnyError_Covers4xx(t *testing.T) {
 	}
 }
 
+func TestIntegration_OCIAuth_TransparentTokenResolution(t *testing.T) {
+	// Track calls to the token server
+	var tokenEndpointCalls atomic.Int32
+
+	// Create token server that returns a valid token
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEndpointCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry server that returns 401 without Authorization, 200 with it
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with challenge pointing to local token server
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository:library/test:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: return success with ETag
+		w.Header().Set("ETag", testManifestETag)
+		w.Header().Set("Content-Type", dockerManifestV2MediaType)
+		w.Write([]byte(`{"schemaVersion":2,"mediaType":dockerManifestV2MediaType}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	// Client with no redirect following to inspect the response
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req.Header.Set("Accept", dockerManifestV2MediaType)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	// With ociAuthTransport wired in, the proxy should transparently resolve the challenge
+	// and return 303 (redirect to cached content), never exposing the 401 to the client
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	// Verify token endpoint was called exactly once
+	if tokenEndpointCalls.Load() != 1 {
+		t.Errorf("expected token endpoint to be called once, got %d calls", tokenEndpointCalls.Load())
+	}
+
+	// Verify content was cached with correct ETag
+	upstreamURL, _ := url.Parse(upstream.URL)
+	baseCachedURL := "https://" + upstreamURL.Host + "/v2/library/test/manifests/latest"
+	cacheKey := baseCachedURL + "\x00" + dockerManifestV2MediaType
+
+	entry := cache.get(cacheKey)
+	if entry == nil {
+		t.Fatal("expected manifest to be cached")
+	}
+
+	if entry.headers.Get("ETag") != testManifestETag {
+		t.Fatalf("expected cached ETag %q, got %q", testManifestETag, entry.headers.Get("ETag"))
+	}
+}
+
+func TestIntegration_DockerHubAuthPath_ForwardsClientAuth(t *testing.T) {
+	t.Skip("proxy-level Authorization forwarding not yet implemented; OCI transport-level bypass tested in oci_auth_test.go (AC3.6)")
+
+	// Create a local token server so upstream challenge doesn't reference external URLs
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	var receivedAuth string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAuth = r.Header.Get("Authorization")
+		if receivedAuth == "" {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+tokenServer.URL+`/token"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("authenticated content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	token := "Bearer dGVzdC10b2tlbg=="
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req.Header.Set("Authorization", token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	// Upstream should have received the Authorization header
+	if receivedAuth != token {
+		t.Errorf("expected upstream to receive Authorization %q, got %q", token, receivedAuth)
+	}
+
+	// Request should succeed (redirect to cached content)
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Errorf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+}
+
+func TestIntegration_OCIAuth_CacheRevalidation(t *testing.T) {
+	// Track calls to the token server and upstream requests
+	var (
+		tokenEndpointCalls   atomic.Int32
+		upstreamRequestCount atomic.Int32
+	)
+
+	// Create token server that returns a valid token
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEndpointCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry server that requires auth
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequestCount.Add(1)
+
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with OCI Bearer challenge
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository:library/test:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: check for conditional request
+		if r.Header.Get("If-None-Match") == testManifestETag {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		// Return full manifest with ETag
+		w.Header().Set("ETag", testManifestETag)
+		w.Header().Set("Content-Type", dockerManifestV2MediaType)
+		w.Write([]byte(`{"schemaVersion":2,"mediaType":dockerManifestV2MediaType}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: initial fetch, populates cache
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", dockerManifestV2MediaType)
+
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	initialTokenCalls := tokenEndpointCalls.Load()
+	if initialTokenCalls != 1 {
+		t.Errorf("after first request: expected 1 token call, got %d", initialTokenCalls)
+	}
+
+	// Second request: should use cached token and send If-None-Match to upstream
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", dockerManifestV2MediaType)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Token endpoint should still be called once (cached token reused)
+	// The transport may proactively discover/refresh tokens, but shouldn't do extra unnecessary calls
+	finalTokenCalls := tokenEndpointCalls.Load()
+	if finalTokenCalls > 1 {
+		t.Errorf("after second request: expected at most 1 token call (cached), got %d", finalTokenCalls)
+	}
+
+	// Verify upstream received conditional request on second call
+	// With singleflight + token caching:
+	// First request: 401 (no auth) → transport fetches token → 200 (with auth after token fetch)
+	// Second request: 304 (with auth + If-None-Match)
+	// Total: 3 upstream requests
+	if upstreamRequestCount.Load() != 3 {
+		t.Errorf("expected exactly 3 upstream requests (401, 200, 304), got %d", upstreamRequestCount.Load())
+	}
+}
+
+func TestIntegration_OCIAuth_DifferentRepositories(t *testing.T) {
+	// Track calls to the token server
+	var tokenEndpointCalls atomic.Int32
+
+	// Create token server that returns a valid token
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEndpointCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry server that requires auth
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with OCI Bearer challenge
+			// Different repositories have different scopes, so each requires separate token fetch
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository` + r.URL.Path + `:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: return manifest with ETag
+		w.Header().Set("ETag", testManifestETag)
+		w.Header().Set("Content-Type", dockerManifestV2MediaType)
+		w.Write([]byte(`{"schemaVersion":2,"mediaType":dockerManifestV2MediaType}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Request first repository
+	proxyPath1 := upstreamHostPath(upstream, "/v2/library/ubuntu/manifests/latest")
+
+	resp1, err := client.Get(proxy.URL + proxyPath1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	defer resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	// Request second repository (different scope)
+	proxyPath2 := upstreamHostPath(upstream, "/v2/library/alpine/manifests/latest")
+
+	resp2, err := client.Get(proxy.URL + proxyPath2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Each repository has a different scope, so each triggers a separate token fetch
+	if tokenEndpointCalls.Load() != 2 {
+		t.Errorf("expected token endpoint to be called twice (once per scope), got %d calls", tokenEndpointCalls.Load())
+	}
+
+	// Verify both manifests were cached
+	upstreamURL, _ := url.Parse(upstream.URL)
+
+	cachedURL1 := "https://" + upstreamURL.Host + "/v2/library/ubuntu/manifests/latest"
+
+	entry1 := cache.get(cachedURL1)
+	if entry1 == nil {
+		t.Fatal("expected ubuntu manifest to be cached")
+	}
+
+	cachedURL2 := "https://" + upstreamURL.Host + "/v2/library/alpine/manifests/latest"
+
+	entry2 := cache.get(cachedURL2)
+	if entry2 == nil {
+		t.Fatal("expected alpine manifest to be cached")
+	}
+}
+
+// TestIntegration_OCIAuth_GCRDistrolessDigest exercises the full proxy stack with
+// a real-world gcr.io-style URL containing a sha256: digest reference. Verifies
+// that the colon in the digest doesn't break URL parsing, S3 cache keying, or
+// OCI auth challenge resolution across initial fetch and cache revalidation.
+func TestIntegration_OCIAuth_GCRDistrolessDigest(t *testing.T) {
+	const digest = "sha256:372adf30255bcdfc80b22ee926fe19c163a7675b737d201f4a09be4877a69e3a"
+
+	manifestBody := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`
+
+	var (
+		tokenCalls    atomic.Int32
+		upstreamCalls atomic.Int32
+	)
+
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"gcr-test-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+
+		if r.Header.Get("Authorization") == "" {
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="gcr.io",scope="repository:distroless/base:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Conditional request: return 304
+		if r.Header.Get("If-None-Match") == `"distroless-etag"` {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		// Full response
+		w.Header().Set("ETag", `"distroless-etag"`)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.Write([]byte(manifestBody))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/distroless/base/manifests/"+digest)
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: discovery (401 → token fetch → retry with token → 200 → cached)
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
+
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	// Verify cached with correct key (contains colon from sha256:)
+	upstreamURL, _ := url.Parse(upstream.URL)
+	baseCachedURL := "https://" + upstreamURL.Host + "/v2/distroless/base/manifests/" + digest
+	cacheKey := baseCachedURL + "\x00" + "application/vnd.oci.image.manifest.v1+json"
+
+	entry := cache.get(cacheKey)
+	if entry == nil {
+		t.Fatal("expected manifest to be cached")
+	}
+
+	if entry.headers.Get("ETag") != `"distroless-etag"` {
+		t.Errorf("cached ETag: got %q, want %q", entry.headers.Get("ETag"), `"distroless-etag"`)
+	}
+
+	if entry.headers.Get("Docker-Content-Digest") != digest {
+		t.Errorf("cached Docker-Content-Digest: got %q, want %q", entry.headers.Get("Docker-Content-Digest"), digest)
+	}
+
+	// Second request: proactive token + conditional request → 304 → serve from cache
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Token fetched once, reused on second request
+	if tokenCalls.Load() != 1 {
+		t.Errorf("expected 1 token fetch (reused), got %d", tokenCalls.Load())
+	}
+
+	// Upstream: 401 + 200 (first request), 304 (second request) = 3
+	if upstreamCalls.Load() != 3 {
+		t.Errorf("expected 3 upstream calls (401, 200, 304), got %d", upstreamCalls.Load())
+	}
+}
+
 func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	var requestCount atomic.Int32
 
@@ -918,6 +1393,921 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 
 	if resp2.StatusCode != http.StatusSeeOther {
 		t.Errorf("expected 303 redirect (stale fallback on conn error), got %d", resp2.StatusCode)
+	}
+}
+
+// Unit tests for ociAwareKeyFunc (AC2.1, AC2.2)
+
+func TestOCIAwareKeyFunc_OCI_IncludesAccept(t *testing.T) {
+	// AC2.1: OCI path with Accept header includes Accept in CacheKey.Variant
+	u, _ := url.Parse("https://gcr.io/v2/library/test/manifests/latest")
+	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+	req.Header.Set("Accept", ociImageIndexMediaType)
+
+	key := ociAwareKeyFunc(u, req)
+
+	if key.Variant != ociImageIndexMediaType {
+		t.Errorf("expected variant %q, got %q", ociImageIndexMediaType, key.Variant)
+	}
+
+	if key.URL != u {
+		t.Errorf("expected URL to be preserved")
+	}
+}
+
+func TestOCIAwareKeyFunc_NonOCI_IgnoresAccept(t *testing.T) {
+	// AC2.2: Non-OCI path produces CacheKey with empty Variant regardless of Accept header
+	u, _ := url.Parse("https://example.com/file.txt")
+	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+	req.Header.Set("Accept", dockerManifestV2MediaType)
+
+	key := ociAwareKeyFunc(u, req)
+
+	if key.Variant != "" {
+		t.Errorf("expected empty variant for non-OCI path, got %q", key.Variant)
+	}
+
+	if key.URL != u {
+		t.Errorf("expected URL to be preserved")
+	}
+}
+
+func TestOCIAwareKeyFunc_OCI_NoAcceptHeader(t *testing.T) {
+	// Verify that OCI path with no Accept header produces empty variant
+	u, _ := url.Parse("https://gcr.io/v2/library/test/manifests/latest")
+	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+	// No Accept header set
+
+	key := ociAwareKeyFunc(u, req)
+
+	if key.Variant != "" {
+		t.Errorf("expected empty variant when Accept header absent, got %q", key.Variant)
+	}
+}
+
+// Integration tests for Accept forwarding (AC2.3, AC2.4)
+
+func TestIntegration_AcceptForwarding(t *testing.T) {
+	tests := []struct {
+		name           string
+		path           string
+		sendAccept     string
+		expectedAccept string
+	}{
+		{
+			name:           "OCI_WithAccept",
+			path:           "/v2/library/test/manifests/latest",
+			sendAccept:     dockerManifestV2MediaType,
+			expectedAccept: dockerManifestV2MediaType,
+		},
+		{
+			name:           "OCI_NoAccept",
+			path:           "/v2/library/test/manifests/latest",
+			sendAccept:     "",
+			expectedAccept: "",
+		},
+		{
+			name:           "NonOCI_WithAccept",
+			path:           "/file.txt",
+			sendAccept:     "text/plain",
+			expectedAccept: "text/plain",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var receivedAccept string
+
+			upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				receivedAccept = r.Header.Get("Accept")
+				w.Header().Set("ETag", `"test-etag"`)
+				w.Write([]byte("content"))
+			}))
+			defer upstream.Close()
+
+			cache := newFakeCache()
+
+			proxy := newTestServer(upstream, cache)
+			defer proxy.Close()
+
+			proxyPath := upstreamHostPath(upstream, tt.path)
+
+			client := &http.Client{
+				CheckRedirect: func(req *http.Request, via []*http.Request) error {
+					return http.ErrUseLastResponse
+				},
+			}
+
+			req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+			if tt.sendAccept != "" {
+				req.Header.Set("Accept", tt.sendAccept)
+			}
+
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatalf("request failed: %v", err)
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusSeeOther {
+				t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+			}
+
+			if receivedAccept != tt.expectedAccept {
+				t.Errorf("expected upstream Accept %q, got %q", tt.expectedAccept, receivedAccept)
+			}
+		})
+	}
+}
+
+// Singleflight dedup tests with Accept (AC3.1, AC3.2)
+
+func TestIntegration_SingleflightDedup_SameAccept(t *testing.T) {
+	// AC3.1: Concurrent OCI requests with same URL and same Accept are deduplicated
+	var upstreamHits atomic.Int32
+
+	upstreamDelay := 100 * time.Millisecond
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		time.Sleep(upstreamDelay)
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Header().Set("Content-Type", dockerManifestV2MediaType)
+		w.Write([]byte(`{"schemaVersion":2}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	const numRequests = 5
+
+	var wg sync.WaitGroup
+
+	results := make(chan *http.Response, numRequests)
+
+	// Launch concurrent requests with same Accept header
+	for range numRequests {
+		wg.Go(func() {
+			req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+			req.Header.Set("Accept", dockerManifestV2MediaType)
+
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Errorf("request failed: %v", err)
+
+				return
+			}
+
+			results <- resp
+		})
+	}
+
+	wg.Wait()
+	close(results)
+
+	var redirectCount int
+
+	for resp := range results {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusSeeOther {
+			redirectCount++
+		} else {
+			t.Errorf("unexpected status: %d, expected 303", resp.StatusCode)
+		}
+	}
+
+	if redirectCount != numRequests {
+		t.Errorf("expected %d redirects, got %d", numRequests, redirectCount)
+	}
+
+	// Only one upstream request should have been made (deduplication)
+	if upstreamHits.Load() != 1 {
+		t.Errorf("expected 1 upstream hit (deduplication), got %d", upstreamHits.Load())
+	}
+}
+
+func TestIntegration_SingleflightDedup_DifferentAccept(t *testing.T) {
+	// AC3.2: Concurrent OCI requests with same URL but different Accept are NOT deduplicated
+	var upstreamHits atomic.Int32
+
+	upstreamDelay := 100 * time.Millisecond
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		time.Sleep(upstreamDelay)
+
+		accept := r.Header.Get("Accept")
+		w.Header().Set("ETag", `"test-etag"`)
+
+		// Return different responses based on Accept header
+		switch accept {
+		case ociImageIndexMediaType:
+			w.Header().Set("Content-Type", ociImageIndexMediaType)
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":ociImageIndexMediaType}`))
+		case dockerManifestV2MediaType:
+			w.Header().Set("Content-Type", dockerManifestV2MediaType)
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":dockerManifestV2MediaType}`))
+		default:
+			w.Write([]byte(`{"schemaVersion":2}`))
+		}
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	var wg sync.WaitGroup
+
+	results := make(chan *http.Response, 2)
+
+	// Request 1 with first Accept
+	wg.Go(func() {
+		req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+		req.Header.Set("Accept", ociImageIndexMediaType)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Errorf("request 1 failed: %v", err)
+
+			return
+		}
+
+		results <- resp
+	})
+
+	// Request 2 with different Accept, delayed to ensure overlap with request 1
+	wg.Go(func() {
+		time.Sleep(20 * time.Millisecond) // Ensure request 1 is in-flight
+
+		req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+		req.Header.Set("Accept", dockerManifestV2MediaType)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Errorf("request 2 failed: %v", err)
+
+			return
+		}
+
+		results <- resp
+	})
+
+	wg.Wait()
+	close(results)
+
+	var redirectCount int
+
+	for resp := range results {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusSeeOther {
+			redirectCount++
+		} else {
+			t.Errorf("unexpected status: %d, expected 303", resp.StatusCode)
+		}
+	}
+
+	if redirectCount != 2 {
+		t.Errorf("expected 2 redirects, got %d", redirectCount)
+	}
+
+	// Two upstream requests should have been made (NOT deduplicated)
+	// because the Accept headers differ
+	if upstreamHits.Load() != 2 {
+		t.Errorf("expected 2 upstream hits (different Accept = no dedup), got %d", upstreamHits.Load())
+	}
+}
+
+func TestIntegration_OCIAccept_DifferentAcceptSeparateCacheEntries(t *testing.T) {
+	// AC4.1: Two OCI requests with different Accept headers produce separate cache entries
+	var upstreamHits atomic.Int32
+
+	// Create token server
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry that returns different responses based on Accept header
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with challenge
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository:library/test:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: check the Accept header and return different content
+		accept := r.Header.Get("Accept")
+		switch accept {
+		case ociImageIndexMediaType:
+			w.Header().Set("ETag", `"oci-index-etag"`)
+			w.Header().Set("Content-Type", ociImageIndexMediaType)
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":ociImageIndexMediaType}`))
+		case dockerManifestV2MediaType:
+			w.Header().Set("ETag", `"docker-manifest-etag"`)
+			w.Header().Set("Content-Type", dockerManifestV2MediaType)
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":dockerManifestV2MediaType}`))
+		default:
+			w.Header().Set("ETag", `"generic-etag"`)
+			w.Write([]byte(`{"schemaVersion":2}`))
+		}
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request with Accept: application/vnd.oci.image.index.v1+json
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", ociImageIndexMediaType)
+
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	// Second request with Accept: application/vnd.docker.distribution.manifest.v2+json
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", dockerManifestV2MediaType)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Both requests should have hit upstream (not served from same cache entry)
+	// With OCI auth:
+	// First request: 401 (no auth) → token fetch → 200 (with auth) = 2 upstream hits
+	// Second request: proactive auth (cached challenge) → 200 = 1 upstream hit
+	// Total: 3 upstream hits
+	if upstreamHits.Load() != 3 {
+		t.Fatalf("expected 3 upstream hits (401, 200 for first; proactive 200 for second), got %d", upstreamHits.Load())
+	}
+
+	// Verify fakeCache contains TWO separate entries with different keys
+	upstreamURL, _ := url.Parse(upstream.URL)
+	baseCachedURL := "https://" + upstreamURL.Host + "/v2/library/test/manifests/latest"
+
+	// Entry 1: URL + OCI Accept variant
+	cacheKey1 := baseCachedURL + "\x00" + ociImageIndexMediaType
+
+	entry1 := cache.get(cacheKey1)
+	if entry1 == nil {
+		t.Fatal("expected OCI index entry to be cached")
+	}
+
+	if entry1.headers.Get("Content-Type") != ociImageIndexMediaType {
+		t.Fatalf("OCI index entry: expected Content-Type application/vnd.oci.image.index.v1+json, got %q",
+			entry1.headers.Get("Content-Type"))
+	}
+
+	// Entry 2: URL + Docker manifest Accept variant
+	cacheKey2 := baseCachedURL + "\x00" + dockerManifestV2MediaType
+
+	entry2 := cache.get(cacheKey2)
+	if entry2 == nil {
+		t.Fatal("expected Docker manifest entry to be cached")
+	}
+
+	if entry2.headers.Get("Content-Type") != dockerManifestV2MediaType {
+		t.Fatalf("Docker manifest entry: expected Content-Type application/vnd.docker.distribution.manifest.v2+json, got %q",
+			entry2.headers.Get("Content-Type"))
+	}
+}
+
+func TestIntegration_OCIAccept_SameAcceptCacheHit(t *testing.T) {
+	// AC4.2: Second request with the same Accept header must hit cache
+	var (
+		tokenEndpointCalls   atomic.Int32
+		upstreamRequestCount atomic.Int32
+	)
+
+	// Create token server
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenEndpointCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Create upstream registry that requires auth and supports conditional requests
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamRequestCount.Add(1)
+
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with OCI Bearer challenge
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository:library/test:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Has auth header: check for conditional request
+		if r.Header.Get("If-None-Match") == testManifestETag {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		// Return full manifest with ETag
+		w.Header().Set("ETag", testManifestETag)
+		w.Header().Set("Content-Type", ociImageIndexMediaType)
+		w.Write([]byte(`{"schemaVersion":2,"mediaType":ociImageIndexMediaType}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: initial fetch, populates cache
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", ociImageIndexMediaType)
+
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	// Second request with same Accept: should use cached token and send If-None-Match
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", ociImageIndexMediaType)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Verify upstream pattern: 401 (no auth), 200 (auth successful), 304 (conditional)
+	if upstreamRequestCount.Load() != 3 {
+		t.Fatalf("expected 3 upstream requests (401, 200, 304), got %d", upstreamRequestCount.Load())
+	}
+
+	// Token endpoint should be called once (cached token on second request)
+	if tokenEndpointCalls.Load() > 1 {
+		t.Fatalf("expected at most 1 token endpoint call, got %d", tokenEndpointCalls.Load())
+	}
+}
+
+func TestIntegration_OCIAccept_CacheRevalidationWithAcceptKey(t *testing.T) {
+	// AC4.3: Cache revalidation must use the correct ETag from the Accept-specific cache entry
+	var upstreamHits atomic.Int32
+
+	// Create token server
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"test-access-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	// Track which If-None-Match values we receive
+	var (
+		receivedETags []string
+		etagsMu       sync.Mutex
+	)
+
+	// Create upstream registry that tracks ETags in conditional requests
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		if r.Header.Get("Authorization") == "" {
+			// No auth header: return 401 with OCI Bearer challenge
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="test-registry",scope="repository:library/test:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Record any If-None-Match value
+		ifNoneMatch := r.Header.Get("If-None-Match")
+		if ifNoneMatch != "" {
+			etagsMu.Lock()
+
+			receivedETags = append(receivedETags, ifNoneMatch)
+			etagsMu.Unlock()
+		}
+
+		// Check the Accept header and return different ETags
+		accept := r.Header.Get("Accept")
+
+		switch accept {
+		case ociImageIndexMediaType:
+			if ifNoneMatch == `"etag-a"` {
+				w.WriteHeader(http.StatusNotModified)
+
+				return
+			}
+
+			w.Header().Set("ETag", `"etag-a"`)
+			w.Header().Set("Content-Type", ociImageIndexMediaType)
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":ociImageIndexMediaType}`))
+		case dockerManifestV2MediaType:
+			if ifNoneMatch == `"etag-b"` {
+				w.WriteHeader(http.StatusNotModified)
+
+				return
+			}
+
+			w.Header().Set("ETag", `"etag-b"`)
+			w.Header().Set("Content-Type", dockerManifestV2MediaType)
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":dockerManifestV2MediaType}`))
+		}
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Step 1: Request format A (OCI index)
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", ociImageIndexMediaType)
+
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("request 1 failed: %v", err)
+	}
+
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 1: expected 303, got %d", resp1.StatusCode)
+	}
+
+	// Step 2: Request format B (Docker manifest)
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", dockerManifestV2MediaType)
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("request 2 failed: %v", err)
+	}
+
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 2: expected 303, got %d", resp2.StatusCode)
+	}
+
+	// Step 3: Request format A again (should revalidate with etag-a, not etag-b)
+	req3, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req3.Header.Set("Accept", ociImageIndexMediaType)
+
+	resp3, err := client.Do(req3)
+	if err != nil {
+		t.Fatalf("request 3 failed: %v", err)
+	}
+
+	resp3.Body.Close()
+
+	if resp3.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 3: expected 303, got %d", resp3.StatusCode)
+	}
+
+	// Step 4: Request format B again (should revalidate with etag-b, not etag-a)
+	req4, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req4.Header.Set("Accept", dockerManifestV2MediaType)
+
+	resp4, err := client.Do(req4)
+	if err != nil {
+		t.Fatalf("request 4 failed: %v", err)
+	}
+
+	resp4.Body.Close()
+
+	if resp4.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 4: expected 303, got %d", resp4.StatusCode)
+	}
+
+	// Verify the ETags sent in If-None-Match conditional requests
+	// Should have two conditional requests: one with "etag-a" and one with "etag-b"
+	etagsMu.Lock()
+	defer etagsMu.Unlock()
+
+	if len(receivedETags) != 2 {
+		t.Fatalf("expected 2 If-None-Match conditional requests, got %d; values: %v",
+			len(receivedETags), receivedETags)
+	}
+
+	// Requests are sequential and deterministic, so order is guaranteed
+	if receivedETags[0] != `"etag-a"` {
+		t.Errorf("expected first If-None-Match to be %q, got %q",
+			`"etag-a"`, receivedETags[0])
+	}
+
+	if receivedETags[1] != `"etag-b"` {
+		t.Errorf("expected second If-None-Match to be %q, got %q",
+			`"etag-b"`, receivedETags[1])
+	}
+}
+
+// TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
+func TestIntegration_NonOCI_AcceptIgnoredInCacheKey(t *testing.T) {
+	// AC4.4: Non-OCI requests with different Accept headers share the same cache entry
+	var upstreamHits atomic.Int32
+
+	// Standard upstream server (no OCI auth)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		// Check for conditional request
+		if r.Header.Get("If-None-Match") == `"file-etag"` {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		w.Header().Set("ETag", `"file-etag"`)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("file content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/file.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request with Accept: text/html
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", "text/html")
+
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("after first request: expected 1 upstream hit, got %d", upstreamHits.Load())
+	}
+
+	// Second request with different Accept: application/json (should use same cache entry)
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", "application/json")
+
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Verify upstream was hit twice total (initial fetch + conditional revalidation)
+	// NOT three times, which would happen if Accept caused a separate cache entry
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("expected 2 upstream hits (same cache entry), got %d", upstreamHits.Load())
+	}
+}
+
+// TestIntegration_CacheRefreshOnUpstreamChange verifies the full cache lifecycle:
+// miss → hit (304) → upstream changes → re-fetch (200) → hit (304 with new ETag).
+func TestIntegration_CacheRefreshOnUpstreamChange(t *testing.T) {
+	var upstreamHits atomic.Int32
+
+	var mu sync.Mutex
+
+	currentETag := `"etag-v1"`
+	currentBody := "body-v1"
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		mu.Lock()
+		etag := currentETag
+		body := currentBody
+		mu.Unlock()
+
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte(body))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/test.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cacheKey := "https://" + upstreamURL.Host + "/test.txt"
+
+	// 1. First request: cache miss → upstream returns 200 with etag-v1
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request 1 failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 1: expected 303, got %d", resp.StatusCode)
+	}
+
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("request 1: expected 1 upstream hit, got %d", upstreamHits.Load())
+	}
+
+	entry := cache.get(cacheKey)
+	if entry == nil {
+		t.Fatal("request 1: expected cache entry")
+	}
+
+	if entry.headers.Get("ETag") != `"etag-v1"` {
+		t.Fatalf("request 1: expected ETag %q, got %q", `"etag-v1"`, entry.headers.Get("ETag"))
+	}
+
+	if string(entry.body) != "body-v1" {
+		t.Fatalf("request 1: expected body %q, got %q", "body-v1", entry.body)
+	}
+
+	// 2. Second request: cache hit → upstream receives If-None-Match: "etag-v1" → 304
+	resp, err = client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request 2 failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 2: expected 303, got %d", resp.StatusCode)
+	}
+
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("request 2: expected 2 upstream hits, got %d", upstreamHits.Load())
+	}
+
+	// 3. Upstream content changes (simulates new push to mutable tag)
+	mu.Lock()
+	currentETag = `"etag-v2"`
+	currentBody = "body-v2"
+	mu.Unlock()
+
+	// Third request: cached ETag no longer matches → upstream returns 200 with new content
+	resp, err = client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request 3 failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 3: expected 303, got %d", resp.StatusCode)
+	}
+
+	if upstreamHits.Load() != 3 {
+		t.Fatalf("request 3: expected 3 upstream hits, got %d", upstreamHits.Load())
+	}
+
+	// Cache should now have the new content
+	entry = cache.get(cacheKey)
+	if entry == nil {
+		t.Fatal("request 3: expected cache entry")
+	}
+
+	if entry.headers.Get("ETag") != `"etag-v2"` {
+		t.Fatalf("request 3: expected ETag %q, got %q", `"etag-v2"`, entry.headers.Get("ETag"))
+	}
+
+	if string(entry.body) != "body-v2" {
+		t.Fatalf("request 3: expected body %q, got %q", "body-v2", entry.body)
+	}
+
+	// 4. Fourth request: new ETag matches → 304 again
+	resp, err = client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request 4 failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("request 4: expected 303, got %d", resp.StatusCode)
+	}
+
+	if upstreamHits.Load() != 4 {
+		t.Fatalf("request 4: expected 4 upstream hits, got %d", upstreamHits.Load())
 	}
 }
 

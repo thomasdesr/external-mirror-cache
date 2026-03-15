@@ -28,6 +28,11 @@ linters:
 
 
   settings:
+    tagliatelle:
+      case:
+        rules:
+          json: snake
+
     godox:
       keywords:
         - TKTK

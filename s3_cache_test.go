@@ -34,8 +34,8 @@ func TestS3PathForIsPure(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := genURL().Draw(t, "url")
 
-		path1 := cache.s3PathFor(u)
-		path2 := cache.s3PathFor(u)
+		path1 := cache.s3PathFor(CacheKey{URL: u})
+		path2 := cache.s3PathFor(CacheKey{URL: u})
 
 		if path1 != path2 {
 			t.Fatalf("s3PathFor is not pure: %q != %q for URL %v", path1, path2, u)
@@ -50,8 +50,8 @@ func TestS3PathForDeterministic(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := genURL().Draw(t, "url")
 
-		path1 := cache1.s3PathFor(u)
-		path2 := cache2.s3PathFor(u)
+		path1 := cache1.s3PathFor(CacheKey{URL: u})
+		path2 := cache2.s3PathFor(CacheKey{URL: u})
 
 		if path1 != path2 {
 			t.Fatalf("s3PathFor is not deterministic across instances: %q != %q", path1, path2)
@@ -68,7 +68,7 @@ func TestS3PathForContainsHostAndPath(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := genURL().Draw(t, "url")
 
-		path := cache.s3PathFor(u)
+		path := cache.s3PathFor(CacheKey{URL: u})
 
 		if len(path) == 0 {
 			t.Fatal("s3PathFor returned empty string")
@@ -103,7 +103,7 @@ func TestS3PathForLeadingSlashStripped(t *testing.T) {
 			Path:   tc.input,
 		}
 
-		got := cache.s3PathFor(u)
+		got := cache.s3PathFor(CacheKey{URL: u})
 		if got != tc.expected {
 			t.Errorf("s3PathFor(%v) = %q, want %q", u, got, tc.expected)
 		}
@@ -134,7 +134,7 @@ func TestS3PathForIncludesQuery(t *testing.T) {
 			RawQuery: tc.query,
 		}
 
-		got := cache.s3PathFor(u)
+		got := cache.s3PathFor(CacheKey{URL: u})
 		if got != tc.expected {
 			t.Errorf("s3PathFor(%v) = %q, want %q", u, got, tc.expected)
 		}
@@ -240,4 +240,119 @@ func TestParseTargetURLRoundTrip(t *testing.T) {
 			t.Fatalf("parseTargetURL round-trip failed: got %q, want %q", u.String(), expectedURL)
 		}
 	})
+}
+
+// TestS3PathForEmptyVariantBackwardCompat verifies AC1.1: empty variant produces
+// the same S3 path as the pre-refactoring URL-only behavior.
+func TestS3PathForEmptyVariantBackwardCompat(t *testing.T) {
+	cache := &s3HTTPCache{
+		bucket: "test-bucket",
+		prefix: "cache",
+	}
+
+	rapid.Check(t, func(t *rapid.T) {
+		u := genURL().Draw(t, "url")
+		key := CacheKey{URL: u}
+
+		result := cache.s3PathFor(key)
+
+		// Reconstruct expected path (URL-only behavior)
+		expected := strings.Join([]string{cache.prefix, u.Host, strings.TrimPrefix(u.Path, "/")}, "/")
+		if u.RawQuery != "" {
+			expected += "?" + url.QueryEscape(u.RawQuery)
+		}
+
+		if result != expected {
+			t.Fatalf("s3PathFor with empty variant: got %q, want %q", result, expected)
+		}
+	})
+}
+
+// TestS3PathForVariantAppendedWithSeparator verifies AC1.2: non-empty variant
+// appends // + URL-escaped variant to the S3 path.
+func TestS3PathForVariantAppendedWithSeparator(t *testing.T) {
+	cache := &s3HTTPCache{
+		bucket: "test-bucket",
+		prefix: "cache",
+	}
+
+	testCases := []struct {
+		name           string
+		variant        string
+		expectedSuffix string
+	}{
+		{"simple media type", "text/plain", "//text%2Fplain"},
+		{"oci image index", "application/vnd.oci.image.index.v1+json", "//application%2Fvnd.oci.image.index.v1+json"},
+		{"comma and space", "a, b", "//a%2C%20b"},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &url.URL{
+				Scheme: "https",
+				Host:   "example.com",
+				Path:   "/api/manifests",
+			}
+
+			key := CacheKey{URL: u, Variant: tc.variant}
+			result := cache.s3PathFor(key)
+
+			if !strings.HasSuffix(result, tc.expectedSuffix) {
+				t.Errorf("s3PathFor with Variant %q: got %q, want suffix %q", tc.variant, result, tc.expectedSuffix)
+			}
+		})
+	}
+}
+
+// TestS3PathForSpecialCharactersEscaped verifies AC1.3: variants with special
+// characters are included in the S3 path and where appropriate, are URL-escaped.
+func TestS3PathForSpecialCharactersEscaped(t *testing.T) {
+	cache := &s3HTTPCache{
+		bucket: "test-bucket",
+		prefix: "cache",
+	}
+
+	testCases := []struct {
+		name           string
+		variant        string
+		expectedSuffix string
+	}{
+		{
+			"forward slash escaped",
+			"application/json",
+			"//application%2Fjson",
+		},
+		{
+			"plus not escaped (reserved char)",
+			"application/vnd.oci+json",
+			"//application%2Fvnd.oci+json",
+		},
+		{
+			"colon not escaped (reserved char)",
+			"text:plain",
+			"//text:plain",
+		},
+		{
+			"space escaped",
+			"accept header",
+			"//accept%20header",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			u := &url.URL{
+				Scheme: "https",
+				Host:   "registry.example.com",
+				Path:   "/v2/image/manifests",
+			}
+
+			key := CacheKey{URL: u, Variant: tc.variant}
+			result := cache.s3PathFor(key)
+
+			if !strings.HasSuffix(result, tc.expectedSuffix) {
+				t.Errorf("s3PathFor with Variant %q: got %q, want suffix %q", tc.variant, result, tc.expectedSuffix)
+			}
+		})
+	}
 }

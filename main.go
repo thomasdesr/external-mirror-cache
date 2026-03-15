@@ -101,8 +101,11 @@ func run() error {
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	transport.IdleConnTimeout = 90 * time.Second
 
+	ociTransport := newOCIAuthTransport(transport)
+	defer ociTransport.Close()
+
 	client := &http.Client{
-		Transport: transport,
+		Transport: ociTransport,
 		Timeout:   5 * time.Minute,
 		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
 			reqlog.FromContext(req.Context()).Debug("following redirect", "url", req.URL.String())
@@ -127,6 +130,7 @@ func run() error {
 			On5xx:             *staleOn5xx,
 			OnAnyError:        *staleOnAnyError,
 		},
+		keyFunc: ociAwareKeyFunc,
 	}
 
 	ln, err := getListener(*listen)

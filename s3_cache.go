@@ -26,10 +26,10 @@ type s3HTTPCache struct {
 	prefix string
 }
 
-// Head checks to see if the provided URL has been cached in S3 and if so
+// Head checks to see if the provided key has been cached in S3 and if so
 // returns its original request's HTTP headers.
-func (c *s3HTTPCache) Head(ctx context.Context, url *url.URL) (http.Header, error) {
-	s3Path := c.s3PathFor(url)
+func (c *s3HTTPCache) Head(ctx context.Context, key CacheKey) (http.Header, error) {
+	s3Path := c.s3PathFor(key)
 	logger := reqlog.FromContext(ctx)
 
 	resp, err := c.s3c.HeadObject(ctx, &s3.HeadObjectInput{
@@ -54,10 +54,10 @@ func (c *s3HTTPCache) Head(ctx context.Context, url *url.URL) (http.Header, erro
 	return metadataToHeader(resp.Metadata)
 }
 
-// GetPresignedURL returns a presigned S3 URL for the provided URL. This does
+// GetPresignedURL returns a presigned S3 URL for the provided key. This does
 // not check if said URL exists.
-func (c *s3HTTPCache) GetPresignedURL(ctx context.Context, url *url.URL) (string, error) {
-	objectPath := c.s3PathFor(url)
+func (c *s3HTTPCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, error) {
+	objectPath := c.s3PathFor(key)
 	logger := reqlog.FromContext(ctx)
 
 	presignedResponse, err := c.s3pc.PresignGetObject(ctx, &s3.GetObjectInput{
@@ -74,9 +74,9 @@ func (c *s3HTTPCache) GetPresignedURL(ctx context.Context, url *url.URL) (string
 }
 
 // Put uploads the provided body to the appropriate path in S3 based on the
-// provided URL and attaches its headers as S3 Object metadata.
-func (c *s3HTTPCache) Put(ctx context.Context, url *url.URL, headers http.Header, body io.Reader) error {
-	objectPath := c.s3PathFor(url)
+// provided key and attaches its headers as S3 Object metadata.
+func (c *s3HTTPCache) Put(ctx context.Context, key CacheKey, headers http.Header, body io.Reader) error {
+	objectPath := c.s3PathFor(key)
 	logger := reqlog.FromContext(ctx)
 
 	metadata, err := headerToMetadata(headers)
@@ -101,10 +101,16 @@ func (c *s3HTTPCache) Put(ctx context.Context, url *url.URL, headers http.Header
 	return nil
 }
 
-func (c *s3HTTPCache) s3PathFor(u *url.URL) string {
+func (c *s3HTTPCache) s3PathFor(key CacheKey) string {
+	u := key.URL
+
 	path := strings.Join([]string{c.prefix, u.Host, strings.TrimPrefix(u.Path, "/")}, "/")
 	if u.RawQuery != "" {
 		path += "?" + url.QueryEscape(u.RawQuery)
+	}
+
+	if key.Variant != "" {
+		path += "//" + url.PathEscape(key.Variant)
 	}
 
 	return path
