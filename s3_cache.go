@@ -37,10 +37,10 @@ func (c *s3HTTPCache) Head(ctx context.Context, key CacheKey) (http.Header, erro
 		Key:    aws.String(s3Path),
 	})
 	if err != nil {
-		// Handle 404 NotFound gracefully because they're expected a lot of the
-		// time.
-		var ae smithy.APIError
-		if errors.As(err, &ae) && ae.ErrorCode() == "NotFound" {
+		// NotFound (404) is the normal cache miss. Forbidden (403) happens when
+		// the IAM role lacks s3:ListBucket — S3 returns 403 instead of 404 for
+		// non-existent keys. Both mean "not in cache."
+		if ae, ok := errors.AsType[smithy.APIError](err); ok && (ae.ErrorCode() == "NotFound" || ae.ErrorCode() == "Forbidden") {
 			logger.Debug("cache miss", "bucket", c.bucket, "key", s3Path)
 
 			return nil, nil //nolint:nilnil // nil,nil is the cache interface's "not found" contract
