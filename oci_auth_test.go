@@ -786,6 +786,7 @@ func testContext(t *testing.T) context.Context {
 func TestExtractOCIRepository(t *testing.T) {
 	tests := []struct {
 		name         string
+		host         string
 		path         string
 		expectedHost string
 		expectedRepo string
@@ -793,6 +794,7 @@ func TestExtractOCIRepository(t *testing.T) {
 	}{
 		{
 			name:         "standard manifests path with multi-level repo",
+			host:         "example.com",
 			path:         "/v2/library/ubuntu/manifests/latest",
 			expectedHost: "example.com",
 			expectedRepo: "library/ubuntu",
@@ -800,6 +802,7 @@ func TestExtractOCIRepository(t *testing.T) {
 		},
 		{
 			name:         "three-level repository path with blobs",
+			host:         "example.com",
 			path:         "/v2/my-org/my-project/my-image/blobs/sha256:abc",
 			expectedHost: "example.com",
 			expectedRepo: "my-org/my-project/my-image",
@@ -807,6 +810,7 @@ func TestExtractOCIRepository(t *testing.T) {
 		},
 		{
 			name:         "two-level repository with tags",
+			host:         "example.com",
 			path:         "/v2/library/ubuntu/tags/list",
 			expectedHost: "example.com",
 			expectedRepo: "library/ubuntu",
@@ -814,6 +818,7 @@ func TestExtractOCIRepository(t *testing.T) {
 		},
 		{
 			name:         "single-level repository with blobs uploads",
+			host:         "example.com",
 			path:         "/v2/repo/blobs/uploads/uuid",
 			expectedHost: "example.com",
 			expectedRepo: "repo",
@@ -821,38 +826,44 @@ func TestExtractOCIRepository(t *testing.T) {
 		},
 		{
 			name:         "single-level repository with manifests and digest",
+			host:         "example.com",
 			path:         "/v2/single/manifests/sha256:def",
 			expectedHost: "example.com",
 			expectedRepo: "single",
 			expectedOK:   true,
 		},
 		{
-			name:         "v2 with trailing slash only",
-			path:         "/v2/",
-			expectedHost: "",
-			expectedRepo: "",
-			expectedOK:   false,
+			name:         "real gcr.io distroless path with full sha256 digest",
+			host:         "gcr.io",
+			path:         "/v2/distroless/base/manifests/sha256:372adf30255bcdfc80b22ee926fe19c163a7675b737d201f4a09be4877a69e3a",
+			expectedHost: "gcr.io",
+			expectedRepo: "distroless/base",
+			expectedOK:   true,
 		},
 		{
-			name:         "non-OCI path",
-			path:         "/other/path",
-			expectedHost: "",
-			expectedRepo: "",
-			expectedOK:   false,
+			name:       "v2 with trailing slash only",
+			host:       "example.com",
+			path:       "/v2/",
+			expectedOK: false,
 		},
 		{
-			name:         "v2 without trailing slash",
-			path:         "/v2",
-			expectedHost: "",
-			expectedRepo: "",
-			expectedOK:   false,
+			name:       "non-OCI path",
+			host:       "example.com",
+			path:       "/other/path",
+			expectedOK: false,
+		},
+		{
+			name:       "v2 without trailing slash",
+			host:       "example.com",
+			path:       "/v2",
+			expectedOK: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			u := &url.URL{
-				Host: "example.com",
+				Host: tt.host,
 				Path: tt.path,
 			}
 

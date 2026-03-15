@@ -1208,6 +1208,116 @@ func TestIntegration_OCIAuth_DifferentRepositories(t *testing.T) {
 	}
 }
 
+// TestIntegration_OCIAuth_GCRDistrolessDigest exercises the full proxy stack with
+// a real-world gcr.io-style URL containing a sha256: digest reference. Verifies
+// that the colon in the digest doesn't break URL parsing, S3 cache keying, or
+// OCI auth challenge resolution across initial fetch and cache revalidation.
+func TestIntegration_OCIAuth_GCRDistrolessDigest(t *testing.T) {
+	const digest = "sha256:372adf30255bcdfc80b22ee926fe19c163a7675b737d201f4a09be4877a69e3a"
+	manifestBody := `{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json"}`
+
+	var (
+		tokenCalls    atomic.Int32
+		upstreamCalls atomic.Int32
+	)
+
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"token":"gcr-test-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
+
+		if r.Header.Get("Authorization") == "" {
+			challenge := `Bearer realm="` + tokenServer.URL +
+				`/token",service="gcr.io",scope="repository:distroless/base:pull"`
+			w.Header().Set("WWW-Authenticate", challenge)
+			w.Header().Set("Docker-Distribution-Api-Version", "registry/2.0")
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Conditional request: return 304
+		if r.Header.Get("If-None-Match") == `"distroless-etag"` {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		// Full response
+		w.Header().Set("ETag", `"distroless-etag"`)
+		w.Header().Set("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+		w.Header().Set("Docker-Content-Digest", digest)
+		w.Write([]byte(manifestBody))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/distroless/base/manifests/"+digest)
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: discovery (401 → token fetch → retry with token → 200 → cached)
+	resp1, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	// Verify cached with correct key (contains colon from sha256:)
+	upstreamURL, _ := url.Parse(upstream.URL)
+	cachedURL := "https://" + upstreamURL.Host + "/v2/distroless/base/manifests/" + digest
+
+	entry := cache.get(cachedURL)
+	if entry == nil {
+		t.Fatal("expected manifest to be cached")
+	}
+
+	if entry.headers.Get("ETag") != `"distroless-etag"` {
+		t.Errorf("cached ETag: got %q, want %q", entry.headers.Get("ETag"), `"distroless-etag"`)
+	}
+
+	if entry.headers.Get("Docker-Content-Digest") != digest {
+		t.Errorf("cached Docker-Content-Digest: got %q, want %q", entry.headers.Get("Docker-Content-Digest"), digest)
+	}
+
+	// Second request: proactive token + conditional request → 304 → serve from cache
+	resp2, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Token fetched once, reused on second request
+	if tokenCalls.Load() != 1 {
+		t.Errorf("expected 1 token fetch (reused), got %d", tokenCalls.Load())
+	}
+
+	// Upstream: 401 + 200 (first request), 304 (second request) = 3
+	if upstreamCalls.Load() != 3 {
+		t.Errorf("expected 3 upstream calls (401, 200, 304), got %d", upstreamCalls.Load())
+	}
+}
+
 func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	var requestCount atomic.Int32
 
