@@ -84,6 +84,77 @@ func TestMiddlewareLogsRequestStart(t *testing.T) {
 	}
 }
 
+// TestMiddlewareAllLogsHaveRequestID verifies that every log line emitted during a request has request_id.
+func TestMiddlewareAllLogsHaveRequestID(t *testing.T) {
+	var buf bytes.Buffer
+	oldDefault := slog.Default()
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	// Use a handler that logs multiple times to generate multiple log lines
+	callCount := 0
+	handler := Middleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		callCount++
+		// Log from within the handler (simulating application code using context logger)
+		logger := FromContext(r.Context())
+		logger.Debug("handler processing")
+		logger.Info("handler info message")
+		logger.Warn("handler warning message")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("response"))
+	}))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/test", nil)
+
+	handler.ServeHTTP(rec, req)
+
+	if callCount != 1 {
+		t.Fatalf("handler was not called")
+	}
+
+	// Parse all log lines and verify each has request_id
+	lines := bytes.Split(buf.Bytes(), []byte("\n"))
+	nonEmptyLines := 0
+	missingRequestIDCount := 0
+	var firstRequestID string
+
+	for _, line := range lines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		nonEmptyLines++
+		var logRecord map[string]interface{}
+		if err := json.Unmarshal(line, &logRecord); err != nil {
+			t.Fatalf("failed to parse log line as JSON: %v (line: %s)", err, string(line))
+		}
+
+		requestID, hasRequestID := logRecord["request_id"]
+		if !hasRequestID || requestID == "" {
+			missingRequestIDCount++
+		} else {
+			// Verify all request_ids are the same
+			if firstRequestID == "" {
+				firstRequestID = requestID.(string)
+			} else if requestID.(string) != firstRequestID {
+				t.Errorf("expected consistent request_id, got %q vs %q", firstRequestID, requestID)
+			}
+		}
+	}
+
+	if nonEmptyLines < 5 {
+		t.Fatalf("expected at least 5 log lines (start, debug, info, warn, end), got %d", nonEmptyLines)
+	}
+
+	if missingRequestIDCount > 0 {
+		t.Errorf("expected all log lines to have request_id, but %d/%d lines were missing it", missingRequestIDCount, nonEmptyLines)
+	}
+}
+
 // TestMiddlewareLogsRequestEnd verifies that Middleware logs request end event with status and duration.
 func TestMiddlewareLogsRequestEnd(t *testing.T) {
 	var buf bytes.Buffer

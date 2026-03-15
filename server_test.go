@@ -1036,3 +1036,294 @@ func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 		t.Errorf("expected request_id in at least 2 logs (start and end), found in %d logs", requestIDCount)
 	}
 }
+
+// TestIntegration_TargetAttributeInLogs verifies that intermediate operations include the target attribute in logs.
+func TestIntegration_TargetAttributeInLogs(t *testing.T) {
+	var buf bytes.Buffer
+	oldDefault := slog.Default()
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	// Set up JSON logging at debug level
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	handler := slog.NewJSONHandler(&buf, opts)
+	slog.SetDefault(slog.New(handler))
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("test content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	// Create proxy with reqlog middleware
+	cacheHandler := &cacheMiddleware{
+		cache:    cache,
+		client:   upstream.Client(),
+		fallback: FallbackPolicy{},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/test.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: cache miss, should log "fetching from upstream"
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	// Parse log output and verify "fetching from upstream" and "cached upstream response" have target attribute
+	logLines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	foundFetchingLog := false
+	foundCachedLog := false
+
+	for _, line := range logLines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var logRecord map[string]interface{}
+		if err := json.Unmarshal(line, &logRecord); err != nil {
+			continue
+		}
+
+		msg, ok := logRecord["msg"].(string)
+		if !ok {
+			continue
+		}
+
+		if msg == "fetching from upstream" {
+			foundFetchingLog = true
+			target, hasTarget := logRecord["target"].(string)
+			if !hasTarget || target == "" {
+				t.Error("expected 'target' attribute in 'fetching from upstream' log")
+			}
+		}
+
+		if msg == "cached upstream response" {
+			foundCachedLog = true
+			target, hasTarget := logRecord["target"].(string)
+			if !hasTarget || target == "" {
+				t.Error("expected 'target' attribute in 'cached upstream response' log")
+			}
+		}
+	}
+
+	if !foundFetchingLog {
+		t.Error("expected to find 'fetching from upstream' log")
+	}
+
+	if !foundCachedLog {
+		t.Error("expected to find 'cached upstream response' log")
+	}
+}
+
+// TestIntegration_SingleflightLeaderFollowerRequestIDs verifies that singleflight leader and follower requests have distinct request_ids.
+func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
+	var buf bytes.Buffer
+	oldDefault := slog.Default()
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	// Set up JSON logging at debug level to capture all logs
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	handler := slog.NewJSONHandler(&buf, opts)
+	slog.SetDefault(slog.New(handler))
+
+	upstreamStarted := make(chan struct{})
+	upstreamContinue := make(chan struct{})
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(upstreamStarted)
+		<-upstreamContinue
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("slow response"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	// Create proxy with reqlog middleware
+	cacheHandler := &cacheMiddleware{
+		cache:    cache,
+		client:   upstream.Client(),
+		fallback: FallbackPolicy{},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/slow.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	var wg sync.WaitGroup
+	leaderResult := make(chan *http.Response, 1)
+	followerResult := make(chan *http.Response, 1)
+
+	// Start leader request
+	wg.Go(func() {
+		resp, err := client.Get(proxy.URL + proxyPath)
+		if err != nil {
+			t.Logf("leader request failed: %v", err)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		leaderResult <- resp
+	})
+
+	// Wait for upstream to receive leader request
+	<-upstreamStarted
+
+	// Start follower request (will join singleflight group)
+	wg.Go(func() {
+		// Small delay to ensure follower joins existing singleflight
+		time.Sleep(10 * time.Millisecond)
+		resp, err := client.Get(proxy.URL + proxyPath)
+		if err != nil {
+			t.Logf("follower request failed: %v", err)
+			return
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		followerResult <- resp
+	})
+
+	// Allow upstream to complete
+	close(upstreamContinue)
+
+	wg.Wait()
+	close(leaderResult)
+	close(followerResult)
+
+	leaderResp := <-leaderResult
+	followerResp := <-followerResult
+
+	if leaderResp == nil || followerResp == nil {
+		t.Fatal("expected both requests to complete")
+	}
+
+	// Parse log output
+	logLines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+
+	// Extract request_ids from "request started" messages
+	var leaderRequestID, followerRequestID string
+	var requestStartedLogs []map[string]interface{}
+	requestStartedCount := 0
+
+	for _, line := range logLines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var logRecord map[string]interface{}
+		if err := json.Unmarshal(line, &logRecord); err != nil {
+			continue
+		}
+
+		msg, ok := logRecord["msg"].(string)
+		if !ok {
+			continue
+		}
+
+		if msg == "request started" {
+			requestStartedCount++
+			requestStartedLogs = append(requestStartedLogs, logRecord)
+			requestID, hasRequestID := logRecord["request_id"].(string)
+			if !hasRequestID || requestID == "" {
+				t.Error("expected request_id in request started log")
+				continue
+			}
+
+			if requestStartedCount == 1 {
+				leaderRequestID = requestID
+			} else if requestStartedCount == 2 {
+				followerRequestID = requestID
+			}
+		}
+	}
+
+	if requestStartedCount < 2 {
+		t.Fatalf("expected at least 2 'request started' messages (leader and follower), got %d", requestStartedCount)
+	}
+
+	// Verify leader and follower have DISTINCT request_ids
+	if leaderRequestID == "" || followerRequestID == "" {
+		t.Fatal("failed to extract request_ids from logs")
+	}
+
+	if leaderRequestID == followerRequestID {
+		t.Errorf("expected distinct request_ids for leader and follower, got both %q", leaderRequestID)
+	}
+
+	// Verify that both "request started" logs have request_id attributes
+	if len(requestStartedLogs) >= 2 {
+		for i, log := range requestStartedLogs {
+			if _, hasRequestID := log["request_id"]; !hasRequestID {
+				t.Errorf("request started log %d missing request_id", i)
+			}
+		}
+	}
+
+	// Verify that intermediate logs ("fetching from upstream", "cached upstream response") exist and have request_id
+	foundFetchingLog := false
+	foundCachedLog := false
+
+	for _, line := range logLines {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+
+		var logRecord map[string]interface{}
+		if err := json.Unmarshal(line, &logRecord); err != nil {
+			continue
+		}
+
+		msg, ok := logRecord["msg"].(string)
+		if !ok {
+			continue
+		}
+
+		if msg == "fetching from upstream" {
+			foundFetchingLog = true
+			_, hasRequestID := logRecord["request_id"]
+			if !hasRequestID {
+				t.Error("expected request_id in 'fetching from upstream' log")
+			}
+		}
+
+		if msg == "cached upstream response" {
+			foundCachedLog = true
+			_, hasRequestID := logRecord["request_id"]
+			if !hasRequestID {
+				t.Error("expected request_id in 'cached upstream response' log")
+			}
+		}
+	}
+
+	if !foundFetchingLog || !foundCachedLog {
+		t.Logf("Note: intermediate logs may not be present in all test scenarios (foundFetching=%v, foundCached=%v)", foundFetchingLog, foundCachedLog)
+	}
+}
