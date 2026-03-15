@@ -2486,8 +2486,9 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 	}
 
 	records := parseJSONLogLines(buf.Bytes())
-	assertLogMsgHasAttr(t, records, "fetching from upstream", "target")
-	assertLogMsgHasAttr(t, records, "cached upstream response", "target")
+	assertLogMsgHasAttr(t, records, "fetching upstream", "target")
+	assertLogMsgHasAttr(t, records, "upstream response", "target")
+	assertLogMsgHasAttr(t, records, "upstream response", "action")
 
 	// Second request: triggers conditional request, upstream returns 304
 	buf.Reset()
@@ -2505,7 +2506,8 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 	}
 
 	records = parseJSONLogLines(buf.Bytes())
-	assertLogMsgHasAttr(t, records, "upstream returned 304, using cached content", "target")
+	assertLogMsgHasAttr(t, records, "upstream response", "target")
+	assertLogMsgHasAttr(t, records, "upstream response", "action")
 }
 
 // TestIntegration_FallbackLoggingAttributes verifies that fallback (stale-serving)
@@ -2579,8 +2581,9 @@ func TestIntegration_FallbackLoggingAttributes(t *testing.T) {
 	}
 
 	records := parseJSONLogLines(buf.Bytes())
-	assertLogMsgHasAttr(t, records, "upstream error status, serving stale", "target")
-	assertLogMsgHasAttr(t, records, "upstream error status, serving stale", "status")
+	assertLogMsgHasAttr(t, records, "upstream response", "target")
+	assertLogMsgHasAttr(t, records, "upstream response", "status")
+	assertLogMsgHasAttr(t, records, "upstream response", "action")
 }
 
 // TestIntegration_SingleflightLeaderFollowerRequestIDs verifies that singleflight leader and follower requests have distinct request_ids.
@@ -2695,8 +2698,8 @@ func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
 		t.Errorf("expected distinct request_ids for leader and follower, got both %q", requestIDs[0])
 	}
 
-	assertLogMsgHasAttr(t, records, "fetching from upstream", "request_id")
-	assertLogMsgHasAttr(t, records, "cached upstream response", "request_id")
+	assertLogMsgHasAttr(t, records, "fetching upstream", "request_id")
+	assertLogMsgHasAttr(t, records, "upstream response", "request_id")
 }
 
 // parseJSONLogLines parses newline-delimited JSON log output into records.

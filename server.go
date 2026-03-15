@@ -97,27 +97,26 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 		cachedHeaders = nil
 	}
 
-	// Build upstream request
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, key.URL.String(), nil)
+	conditionalFetch := cachedHeaders != nil
+
+	fetchType := "first"
+	if conditionalFetch {
+		fetchType = "conditional"
+	}
+
+	logger = logger.With("target", key.URL.String(), "fetch", fetchType)
+
+	req, err := buildUpstreamRequest(ctx, key.URL, accept, cachedHeaders)
 	if err != nil {
-		return "", errorutil.Wrapf(err, "create request for %s", key.URL)
+		return "", err
 	}
 
-	if accept != "" {
-		req.Header.Set("Accept", accept)
-	}
-
-	if cachedHeaders != nil {
-		injectCacheHeadersIntoRequest(req, cachedHeaders)
-	}
-
-	// Fetch from upstream
-	logger.Debug("fetching from upstream", "target", key.URL.String(), "has_cached", cachedHeaders != nil)
+	logger.Debug("fetching upstream")
 
 	resp, err := m.client.Do(req)
 	if err != nil {
-		if cachedHeaders != nil && m.fallback.ShouldFallback(err, 0) {
-			logger.Warn("upstream error, serving stale", "target", key.URL.String(), "error", err)
+		if conditionalFetch && m.fallback.ShouldFallback(err, 0) {
+			logger.Warn("upstream response", "status", 0, "action", "stale", "action_reason", err.Error())
 
 			return m.presign(ctx, key)
 		}
@@ -129,18 +128,25 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 
 	// 304 Not Modified - content already cached
 	if resp.StatusCode == http.StatusNotModified {
-		logger.Info("upstream returned 304, using cached content", "target", key.URL.String())
+		logger.Info("upstream response", "status", resp.StatusCode, "action", "revalidated")
 
 		return m.presign(ctx, key)
 	}
 
 	// Non-200 responses - check fallback policy
 	if resp.StatusCode != http.StatusOK {
-		if cachedHeaders != nil && m.fallback.ShouldFallback(nil, resp.StatusCode) {
-			logger.Warn("upstream error status, serving stale", "target", key.URL.String(), "status", resp.StatusCode)
+		if conditionalFetch && m.fallback.ShouldFallback(nil, resp.StatusCode) {
+			logger.Warn("upstream response", "status", resp.StatusCode, "action", "stale")
 
 			return m.presign(ctx, key)
 		}
+
+		actionReason := "no cached content"
+		if conditionalFetch {
+			actionReason = "fallback policy denied"
+		}
+
+		logger.Info("upstream response", "status", resp.StatusCode, "action", "error", "action_reason", actionReason)
 
 		return "", &upstreamError{StatusCode: resp.StatusCode, URL: key.URL.String()}
 	}
@@ -151,9 +157,30 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 		return "", errorutil.Wrapf(err, "cache %s", key.URL)
 	}
 
-	logger.Debug("cached upstream response", "target", key.URL.String())
+	if conditionalFetch {
+		logger.Info("upstream response", "status", resp.StatusCode, "action", "refreshed", "action_reason", "content modified")
+	} else {
+		logger.Info("upstream response", "status", resp.StatusCode, "action", "cached")
+	}
 
 	return m.presign(ctx, key)
+}
+
+func buildUpstreamRequest(ctx context.Context, target *url.URL, accept string, cachedHeaders http.Header) (*http.Request, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.String(), nil)
+	if err != nil {
+		return nil, errorutil.Wrapf(err, "create request for %s", target)
+	}
+
+	if accept != "" {
+		req.Header.Set("Accept", accept)
+	}
+
+	if cachedHeaders != nil {
+		injectCacheHeadersIntoRequest(req, cachedHeaders)
+	}
+
+	return req, nil
 }
 
 func (m *cacheMiddleware) presign(ctx context.Context, key CacheKey) (string, error) {
