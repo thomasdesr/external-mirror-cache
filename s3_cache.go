@@ -103,6 +103,7 @@ func (c *s3HTTPCache) Put(ctx context.Context, key CacheKey, headers http.Header
 
 func (c *s3HTTPCache) s3PathFor(key CacheKey) string {
 	u := key.URL
+
 	path := strings.Join([]string{c.prefix, u.Host, strings.TrimPrefix(u.Path, "/")}, "/")
 	if u.RawQuery != "" {
 		path += "?" + url.QueryEscape(u.RawQuery)
