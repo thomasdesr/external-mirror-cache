@@ -1541,6 +1541,174 @@ func TestIntegration_AcceptForwarding_NonOCI_WithAccept(t *testing.T) {
 	}
 }
 
+// Singleflight dedup tests with Accept (AC3.1, AC3.2)
+
+func TestIntegration_SingleflightDedup_SameAccept(t *testing.T) {
+	// AC3.1: Concurrent OCI requests with same URL and same Accept are deduplicated
+	var upstreamHits atomic.Int32
+	upstreamDelay := 100 * time.Millisecond
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		time.Sleep(upstreamDelay)
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+		w.Write([]byte(`{"schemaVersion":2}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	const numRequests = 5
+	var wg sync.WaitGroup
+	results := make(chan *http.Response, numRequests)
+
+	// Launch concurrent requests with same Accept header
+	for range numRequests {
+		wg.Go(func() {
+			req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+			req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Errorf("request failed: %v", err)
+				return
+			}
+
+			results <- resp
+		})
+	}
+
+	wg.Wait()
+	close(results)
+
+	var redirectCount int
+	for resp := range results {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusSeeOther {
+			redirectCount++
+		} else {
+			t.Errorf("unexpected status: %d, expected 303", resp.StatusCode)
+		}
+	}
+
+	if redirectCount != numRequests {
+		t.Errorf("expected %d redirects, got %d", numRequests, redirectCount)
+	}
+
+	// Only one upstream request should have been made (deduplication)
+	if upstreamHits.Load() != 1 {
+		t.Errorf("expected 1 upstream hit (deduplication), got %d", upstreamHits.Load())
+	}
+}
+
+func TestIntegration_SingleflightDedup_DifferentAccept(t *testing.T) {
+	// AC3.2: Concurrent OCI requests with same URL but different Accept are NOT deduplicated
+	var upstreamHits atomic.Int32
+	upstreamDelay := 100 * time.Millisecond
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		time.Sleep(upstreamDelay)
+
+		accept := r.Header.Get("Accept")
+		w.Header().Set("ETag", `"test-etag"`)
+
+		// Return different responses based on Accept header
+		if accept == "application/vnd.oci.image.index.v1+json" {
+			w.Header().Set("Content-Type", "application/vnd.oci.image.index.v1+json")
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json"}`))
+		} else if accept == "application/vnd.docker.distribution.manifest.v2+json" {
+			w.Header().Set("Content-Type", "application/vnd.docker.distribution.manifest.v2+json")
+			w.Write([]byte(`{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json"}`))
+		} else {
+			w.Write([]byte(`{"schemaVersion":2}`))
+		}
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	var wg sync.WaitGroup
+	results := make(chan *http.Response, 2)
+
+	// Request 1 with first Accept
+	wg.Go(func() {
+		req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+		req.Header.Set("Accept", "application/vnd.oci.image.index.v1+json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Errorf("request 1 failed: %v", err)
+			return
+		}
+
+		results <- resp
+	})
+
+	// Request 2 with different Accept, delayed to ensure overlap with request 1
+	wg.Go(func() {
+		time.Sleep(20 * time.Millisecond) // Ensure request 1 is in-flight
+		req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+		req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Errorf("request 2 failed: %v", err)
+			return
+		}
+
+		results <- resp
+	})
+
+	wg.Wait()
+	close(results)
+
+	var redirectCount int
+	for resp := range results {
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusSeeOther {
+			redirectCount++
+		} else {
+			t.Errorf("unexpected status: %d, expected 303", resp.StatusCode)
+		}
+	}
+
+	if redirectCount != 2 {
+		t.Errorf("expected 2 redirects, got %d", redirectCount)
+	}
+
+	// Two upstream requests should have been made (NOT deduplicated)
+	// because the Accept headers differ
+	if upstreamHits.Load() != 2 {
+		t.Errorf("expected 2 upstream hits (different Accept = no dedup), got %d", upstreamHits.Load())
+	}
+}
+
 // TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
 func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 	var buf bytes.Buffer
