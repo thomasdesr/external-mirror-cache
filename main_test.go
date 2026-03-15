@@ -26,6 +26,7 @@ func TestLogLevelParsing(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			var level slog.Level
+
 			err := level.UnmarshalText([]byte(tt.level))
 
 			if (err != nil) != tt.wantErr {
@@ -66,6 +67,7 @@ func TestLogLevelFiltering(t *testing.T) {
 			var buf bytes.Buffer
 
 			var level slog.Level
+
 			err := level.UnmarshalText([]byte(tt.configLevel))
 			if err != nil {
 				t.Fatalf("failed to parse level %q: %v", tt.configLevel, err)
@@ -91,6 +93,7 @@ func TestLogLevelFiltering(t *testing.T) {
 			if tt.shouldAppearCount > 0 && output == "" {
 				t.Errorf("expected log message to appear, got empty output")
 			}
+
 			if tt.shouldAppearCount == 0 && output != "" {
 				t.Errorf("expected log message to be filtered, got output: %q", output)
 			}
@@ -114,7 +117,7 @@ func TestJSONHandlerOutput(t *testing.T) {
 	}
 
 	// Verify output is valid JSON
-	var logRecord map[string]interface{}
+	var logRecord map[string]any
 	if err := json.Unmarshal(buf.Bytes(), &logRecord); err != nil {
 		t.Fatalf("expected valid JSON output, got parse error: %v", err)
 	}
@@ -140,7 +143,7 @@ func TestJSONHandlerOutput(t *testing.T) {
 // TestTextHandlerIsUsedForTTY verifies that isTTY correctly identifies terminal vs file.
 func TestIsTTYDetection(t *testing.T) {
 	// Create a temporary non-TTY file
-	tmpFile, err := os.CreateTemp("", "test-notty")
+	tmpFile, err := os.CreateTemp(t.TempDir(), "test-notty")
 	if err != nil {
 		t.Fatalf("failed to create temp file: %v", err)
 	}

@@ -28,6 +28,8 @@ func WithLogger(ctx context.Context, l *slog.Logger) context.Context {
 // NewRequestID generates a 16-character hex string from 8 bytes of crypto/rand.
 func NewRequestID() string {
 	var b [8]byte
+
 	_, _ = rand.Read(b[:]) // crypto/rand.Read never returns error on supported platforms
+
 	return hex.EncodeToString(b[:])
 }

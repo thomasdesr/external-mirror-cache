@@ -16,7 +16,7 @@ func TestMiddlewareSetXRequestIDHeader(t *testing.T) {
 	}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 
 	handler.ServeHTTP(rec, req)
 
@@ -33,7 +33,9 @@ func TestMiddlewareSetXRequestIDHeader(t *testing.T) {
 // TestMiddlewareLogsRequestStart verifies that Middleware logs request start event.
 func TestMiddlewareLogsRequestStart(t *testing.T) {
 	var buf bytes.Buffer
+
 	oldDefault := slog.Default()
+
 	defer func() {
 		slog.SetDefault(oldDefault)
 	}()
@@ -45,21 +47,24 @@ func TestMiddlewareLogsRequestStart(t *testing.T) {
 	}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 
 	handler.ServeHTTP(rec, req)
 
 	output := buf.String()
 	if output == "" {
 		t.Error("expected logs to be written")
+
 		return
 	}
 
 	// Parse the first log line (request start)
-	var logRecord map[string]interface{}
+	var logRecord map[string]any
+
 	lines := bytes.Split(buf.Bytes(), []byte("\n"))
 	if len(lines) < 2 {
 		t.Error("expected at least 2 log lines (start, end)")
+
 		return
 	}
 
@@ -87,7 +92,9 @@ func TestMiddlewareLogsRequestStart(t *testing.T) {
 // TestMiddlewareAllLogsHaveRequestID verifies that every log line emitted during a request has request_id.
 func TestMiddlewareAllLogsHaveRequestID(t *testing.T) {
 	var buf bytes.Buffer
+
 	oldDefault := slog.Default()
+
 	defer func() {
 		slog.SetDefault(oldDefault)
 	}()
@@ -108,7 +115,7 @@ func TestMiddlewareAllLogsHaveRequestID(t *testing.T) {
 	}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 
 	handler.ServeHTTP(rec, req)
 
@@ -120,6 +127,7 @@ func TestMiddlewareAllLogsHaveRequestID(t *testing.T) {
 	lines := bytes.Split(buf.Bytes(), []byte("\n"))
 	nonEmptyLines := 0
 	missingRequestIDCount := 0
+
 	var firstRequestID string
 
 	for _, line := range lines {
@@ -128,7 +136,8 @@ func TestMiddlewareAllLogsHaveRequestID(t *testing.T) {
 		}
 
 		nonEmptyLines++
-		var logRecord map[string]interface{}
+
+		var logRecord map[string]any
 		if err := json.Unmarshal(line, &logRecord); err != nil {
 			t.Fatalf("failed to parse log line as JSON: %v (line: %s)", err, string(line))
 		}
@@ -138,10 +147,15 @@ func TestMiddlewareAllLogsHaveRequestID(t *testing.T) {
 			missingRequestIDCount++
 		} else {
 			// Verify all request_ids are the same
+			rid, ok := requestID.(string)
+			if !ok {
+				t.Fatalf("expected request_id to be string, got %T", requestID)
+			}
+
 			if firstRequestID == "" {
-				firstRequestID = requestID.(string)
-			} else if requestID.(string) != firstRequestID {
-				t.Errorf("expected consistent request_id, got %q vs %q", firstRequestID, requestID)
+				firstRequestID = rid
+			} else if rid != firstRequestID {
+				t.Errorf("expected consistent request_id, got %q vs %q", firstRequestID, rid)
 			}
 		}
 	}
@@ -158,7 +172,9 @@ func TestMiddlewareAllLogsHaveRequestID(t *testing.T) {
 // TestMiddlewareLogsRequestEnd verifies that Middleware logs request end event with status and duration.
 func TestMiddlewareLogsRequestEnd(t *testing.T) {
 	var buf bytes.Buffer
+
 	oldDefault := slog.Default()
+
 	defer func() {
 		slog.SetDefault(oldDefault)
 	}()
@@ -171,18 +187,19 @@ func TestMiddlewareLogsRequestEnd(t *testing.T) {
 	}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 
 	handler.ServeHTTP(rec, req)
 
 	lines := bytes.Split(buf.Bytes(), []byte("\n"))
 	if len(lines) < 2 {
 		t.Error("expected at least 2 log lines")
+
 		return
 	}
 
 	// Parse the second log line (request end)
-	var logRecord map[string]interface{}
+	var logRecord map[string]any
 	if err := json.Unmarshal(lines[1], &logRecord); err != nil {
 		t.Fatalf("failed to parse second log line as JSON: %v", err)
 	}
@@ -207,11 +224,12 @@ func TestMiddlewarePassesLoggerInContext(t *testing.T) {
 		if logger == slog.Default() {
 			t.Error("expected non-default logger in context")
 		}
+
 		w.WriteHeader(http.StatusOK)
 	}))
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest("GET", "/test", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test", nil)
 
 	handler.ServeHTTP(rec, req)
 }
@@ -263,9 +281,9 @@ func BenchmarkMiddleware(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		rec := httptest.NewRecorder()
-		req := httptest.NewRequest("GET", "/test", nil)
+		req := httptest.NewRequest(http.MethodGet, "/test", nil)
 		handler.ServeHTTP(rec, req)
 	}
 }

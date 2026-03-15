@@ -41,7 +41,8 @@ var (
 
 	egressProxy = flag.String("egress-proxy", "", "HTTP CONNECT proxy for upstream requests (e.g. http://127.0.0.1:4750)")
 
-	logLevel = flag.String("log-level", envDefault("MIRROR_CACHE_LOG_LEVEL", "info"), "log level: debug, info, warn, error (env: MIRROR_CACHE_LOG_LEVEL)")
+	logLevel = flag.String("log-level", envDefault("MIRROR_CACHE_LOG_LEVEL", "info"),
+		"log level: debug, info, warn, error (env: MIRROR_CACHE_LOG_LEVEL)")
 
 	staleOnConnectionError = flag.Bool("stale-on-connection-error", true, "serve stale content on connection errors (timeouts, DNS failures)")
 	staleOn5xx             = flag.Bool("stale-on-5xx", true, "serve stale content on upstream 5xx errors")
@@ -60,29 +61,9 @@ func main() {
 var errBucketRequired = errors.New("--bucket or MIRROR_CACHE_BUCKET is required")
 
 func run() error {
-	// Configure structured logging
-	var level slog.Level
-	if err := level.UnmarshalText([]byte(*logLevel)); err != nil {
-		return errorutil.Wrapf(err, "invalid log level %q", *logLevel)
+	if err := setupLogging(*logLevel); err != nil {
+		return err
 	}
-
-	opts := &slog.HandlerOptions{Level: level}
-
-	var slogHandler slog.Handler
-	if isTTY(os.Stderr) {
-		slogHandler = slog.NewTextHandler(os.Stderr, opts)
-	} else {
-		slogHandler = slog.NewJSONHandler(os.Stderr, opts)
-	}
-
-	slog.SetDefault(slog.New(slogHandler))
-
-	slog.Info("starting mirror-cache",
-		"bucket", *bucket,
-		"prefix", *prefix,
-		"listen", *listen,
-		"log_level", level.String(),
-	)
 
 	if *bucket == "" {
 		return errBucketRequired
@@ -166,6 +147,33 @@ func run() error {
 	}
 
 	slog.Info("server stopped")
+
+	return nil
+}
+
+func setupLogging(levelStr string) error {
+	var level slog.Level
+	if err := level.UnmarshalText([]byte(levelStr)); err != nil {
+		return errorutil.Wrapf(err, "invalid log level %q", levelStr)
+	}
+
+	opts := &slog.HandlerOptions{Level: level}
+
+	var handler slog.Handler
+	if isTTY(os.Stderr) {
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	} else {
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	}
+
+	slog.SetDefault(slog.New(handler))
+
+	slog.Info("starting mirror-cache",
+		"bucket", *bucket,
+		"prefix", *prefix,
+		"listen", *listen,
+		"log_level", level.String(),
+	)
 
 	return nil
 }

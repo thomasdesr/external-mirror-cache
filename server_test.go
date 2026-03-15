@@ -924,7 +924,9 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 // TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
 func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 	var buf bytes.Buffer
+
 	oldDefault := slog.Default()
+
 	defer func() {
 		slog.SetDefault(oldDefault)
 	}()
@@ -965,6 +967,7 @@ func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
+
 	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusSeeOther {
@@ -978,7 +981,7 @@ func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 	}
 
 	// Check request started log
-	var requestStartLog map[string]interface{}
+	var requestStartLog map[string]any
 	if err := json.Unmarshal(logLines[0], &requestStartLog); err != nil {
 		t.Fatalf("failed to parse first log line: %v", err)
 	}
@@ -993,7 +996,7 @@ func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 	}
 
 	// Check request completed log (last line)
-	var requestEndLog map[string]interface{}
+	var requestEndLog map[string]any
 	if err := json.Unmarshal(logLines[len(logLines)-1], &requestEndLog); err != nil {
 		t.Fatalf("failed to parse last log line: %v", err)
 	}
@@ -1019,8 +1022,9 @@ func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 	// Verify that request_id appears in multiple logs (from request lifecycle)
 	// This demonstrates structured logging is working across the request
 	requestIDCount := 0
+
 	for _, line := range logLines {
-		var logRecord map[string]interface{}
+		var logRecord map[string]any
 		if err := json.Unmarshal(line, &logRecord); err != nil {
 			continue
 		}
@@ -1040,7 +1044,9 @@ func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 // TestIntegration_TargetAttributeInLogs verifies that intermediate operations include the target attribute in logs.
 func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 	var buf bytes.Buffer
+
 	oldDefault := slog.Default()
+
 	defer func() {
 		slog.SetDefault(oldDefault)
 	}()
@@ -1081,6 +1087,7 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
+
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 
@@ -1098,7 +1105,7 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 			continue
 		}
 
-		var logRecord map[string]interface{}
+		var logRecord map[string]any
 		if err := json.Unmarshal(line, &logRecord); err != nil {
 			continue
 		}
@@ -1110,6 +1117,7 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 
 		if msg == "fetching from upstream" {
 			foundFetchingLog = true
+
 			target, hasTarget := logRecord["target"].(string)
 			if !hasTarget || target == "" {
 				t.Error("expected 'target' attribute in 'fetching from upstream' log")
@@ -1118,6 +1126,7 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 
 		if msg == "cached upstream response" {
 			foundCachedLog = true
+
 			target, hasTarget := logRecord["target"].(string)
 			if !hasTarget || target == "" {
 				t.Error("expected 'target' attribute in 'cached upstream response' log")
@@ -1137,7 +1146,9 @@ func TestIntegration_TargetAttributeInLogs(t *testing.T) {
 // TestIntegration_SingleflightLeaderFollowerRequestIDs verifies that singleflight leader and follower requests have distinct request_ids.
 func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
 	var buf bytes.Buffer
+
 	oldDefault := slog.Default()
+
 	defer func() {
 		slog.SetDefault(oldDefault)
 	}()
@@ -1179,6 +1190,7 @@ func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
 	}
 
 	var wg sync.WaitGroup
+
 	leaderResult := make(chan *http.Response, 1)
 	followerResult := make(chan *http.Response, 1)
 
@@ -1187,10 +1199,13 @@ func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
 		resp, err := client.Get(proxy.URL + proxyPath)
 		if err != nil {
 			t.Logf("leader request failed: %v", err)
+
 			return
 		}
+
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+
 		leaderResult <- resp
 	})
 
@@ -1201,13 +1216,17 @@ func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
 	wg.Go(func() {
 		// Small delay to ensure follower joins existing singleflight
 		time.Sleep(10 * time.Millisecond)
+
 		resp, err := client.Get(proxy.URL + proxyPath)
 		if err != nil {
 			t.Logf("follower request failed: %v", err)
+
 			return
 		}
+
 		io.Copy(io.Discard, resp.Body)
 		resp.Body.Close()
+
 		followerResult <- resp
 	})
 
@@ -1225,105 +1244,70 @@ func TestIntegration_SingleflightLeaderFollowerRequestIDs(t *testing.T) {
 		t.Fatal("expected both requests to complete")
 	}
 
-	// Parse log output
-	logLines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	records := parseJSONLogLines(buf.Bytes())
+	requestIDs := extractRequestIDs(records, "request started")
 
-	// Extract request_ids from "request started" messages
-	var leaderRequestID, followerRequestID string
-	var requestStartedLogs []map[string]interface{}
-	requestStartedCount := 0
+	if len(requestIDs) < 2 {
+		t.Fatalf("expected at least 2 'request started' messages, got %d", len(requestIDs))
+	}
 
-	for _, line := range logLines {
+	if requestIDs[0] == requestIDs[1] {
+		t.Errorf("expected distinct request_ids for leader and follower, got both %q", requestIDs[0])
+	}
+
+	assertLogMsgHasAttr(t, records, "fetching from upstream", "request_id")
+	assertLogMsgHasAttr(t, records, "cached upstream response", "request_id")
+}
+
+// parseJSONLogLines parses newline-delimited JSON log output into records.
+func parseJSONLogLines(data []byte) []map[string]any {
+	var records []map[string]any
+
+	for line := range bytes.SplitSeq(bytes.TrimSpace(data), []byte("\n")) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
 
-		var logRecord map[string]interface{}
-		if err := json.Unmarshal(line, &logRecord); err != nil {
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
 			continue
 		}
 
-		msg, ok := logRecord["msg"].(string)
-		if !ok {
-			continue
-		}
+		records = append(records, record)
+	}
 
-		if msg == "request started" {
-			requestStartedCount++
-			requestStartedLogs = append(requestStartedLogs, logRecord)
-			requestID, hasRequestID := logRecord["request_id"].(string)
-			if !hasRequestID || requestID == "" {
-				t.Error("expected request_id in request started log")
-				continue
-			}
+	return records
+}
 
-			if requestStartedCount == 1 {
-				leaderRequestID = requestID
-			} else if requestStartedCount == 2 {
-				followerRequestID = requestID
+// extractRequestIDs returns all request_id values from log records matching msg.
+func extractRequestIDs(records []map[string]any, msg string) []string {
+	var ids []string
+
+	for _, r := range records {
+		if m, _ := r["msg"].(string); m == msg {
+			if id, _ := r["request_id"].(string); id != "" {
+				ids = append(ids, id)
 			}
 		}
 	}
 
-	if requestStartedCount < 2 {
-		t.Fatalf("expected at least 2 'request started' messages (leader and follower), got %d", requestStartedCount)
-	}
+	return ids
+}
 
-	// Verify leader and follower have DISTINCT request_ids
-	if leaderRequestID == "" || followerRequestID == "" {
-		t.Fatal("failed to extract request_ids from logs")
-	}
+// assertLogMsgHasAttr checks that at least one log record with the given msg
+// contains the specified attribute. Logs a note (not failure) if the msg is not found.
+func assertLogMsgHasAttr(t *testing.T, records []map[string]any, msg, attr string) {
+	t.Helper()
 
-	if leaderRequestID == followerRequestID {
-		t.Errorf("expected distinct request_ids for leader and follower, got both %q", leaderRequestID)
-	}
-
-	// Verify that both "request started" logs have request_id attributes
-	if len(requestStartedLogs) >= 2 {
-		for i, log := range requestStartedLogs {
-			if _, hasRequestID := log["request_id"]; !hasRequestID {
-				t.Errorf("request started log %d missing request_id", i)
+	for _, r := range records {
+		if m, _ := r["msg"].(string); m == msg {
+			if _, ok := r[attr]; !ok {
+				t.Errorf("log %q missing attribute %q", msg, attr)
 			}
+
+			return
 		}
 	}
 
-	// Verify that intermediate logs ("fetching from upstream", "cached upstream response") exist and have request_id
-	foundFetchingLog := false
-	foundCachedLog := false
-
-	for _, line := range logLines {
-		if len(bytes.TrimSpace(line)) == 0 {
-			continue
-		}
-
-		var logRecord map[string]interface{}
-		if err := json.Unmarshal(line, &logRecord); err != nil {
-			continue
-		}
-
-		msg, ok := logRecord["msg"].(string)
-		if !ok {
-			continue
-		}
-
-		if msg == "fetching from upstream" {
-			foundFetchingLog = true
-			_, hasRequestID := logRecord["request_id"]
-			if !hasRequestID {
-				t.Error("expected request_id in 'fetching from upstream' log")
-			}
-		}
-
-		if msg == "cached upstream response" {
-			foundCachedLog = true
-			_, hasRequestID := logRecord["request_id"]
-			if !hasRequestID {
-				t.Error("expected request_id in 'cached upstream response' log")
-			}
-		}
-	}
-
-	if !foundFetchingLog || !foundCachedLog {
-		t.Logf("Note: intermediate logs may not be present in all test scenarios (foundFetching=%v, foundCached=%v)", foundFetchingLog, foundCachedLog)
-	}
+	t.Logf("note: log message %q not found in output", msg)
 }

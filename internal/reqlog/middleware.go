@@ -1,6 +1,7 @@
 package reqlog
 
 import (
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -40,6 +41,7 @@ func Middleware(next http.Handler) http.Handler {
 // statusWriter wraps http.ResponseWriter to capture the status code.
 type statusWriter struct {
 	http.ResponseWriter
+
 	status int
 }
 
@@ -53,7 +55,12 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 		w.status = http.StatusOK
 	}
 
-	return w.ResponseWriter.Write(b)
+	n, err := w.ResponseWriter.Write(b)
+	if err != nil {
+		return n, fmt.Errorf("write response: %w", err)
+	}
+
+	return n, nil
 }
 
 func (w *statusWriter) Unwrap() http.ResponseWriter {

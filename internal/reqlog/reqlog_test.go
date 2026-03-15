@@ -27,11 +27,13 @@ func TestNewRequestIDLength(t *testing.T) {
 // TestNewRequestIDUnique verifies that multiple calls produce unique values.
 func TestNewRequestIDUnique(t *testing.T) {
 	ids := make(map[string]bool)
-	for i := 0; i < 100; i++ {
+
+	for i := range 100 {
 		id := NewRequestID()
 		if ids[id] {
 			t.Errorf("duplicate request ID on iteration %d: %q", i, id)
 		}
+
 		ids[id] = true
 	}
 }
@@ -43,7 +45,7 @@ func TestNewRequestIDProperty(t *testing.T) {
 		numIDs := rapid.IntRange(10, 1000).Draw(t, "numIDs")
 		ids := make(map[string]bool)
 
-		for i := 0; i < numIDs; i++ {
+		for i := range numIDs {
 			id := NewRequestID()
 
 			// Property 1: All IDs are exactly 16 characters
@@ -60,6 +62,7 @@ func TestNewRequestIDProperty(t *testing.T) {
 			if ids[id] {
 				t.Fatalf("duplicate request ID on iteration %d: %q", i, id)
 			}
+
 			ids[id] = true
 		}
 	})
@@ -68,6 +71,7 @@ func TestNewRequestIDProperty(t *testing.T) {
 // TestFromContextWithoutLogger verifies that FromContext returns slog.Default() when no logger is stored.
 func TestFromContextWithoutLogger(t *testing.T) {
 	ctx := context.Background()
+
 	logger := FromContext(ctx)
 	if logger != slog.Default() {
 		t.Error("expected FromContext to return slog.Default() when no logger in context")
