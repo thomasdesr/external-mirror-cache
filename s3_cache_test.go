@@ -277,9 +277,9 @@ func TestS3PathForVariantAppendedWithSeparator(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name            string
-		variant         string
-		expectedSuffix  string
+		name           string
+		variant        string
+		expectedSuffix string
 	}{
 		{"simple media type", "text/plain", "//text%2Fplain"},
 		{"oci image index", "application/vnd.oci.image.index.v1+json", "//application%2Fvnd.oci.image.index.v1+json"},
@@ -313,9 +313,9 @@ func TestS3PathForSpecialCharactersEscaped(t *testing.T) {
 	}
 
 	testCases := []struct {
-		name            string
-		variant         string
-		expectedSuffix  string
+		name           string
+		variant        string
+		expectedSuffix string
 	}{
 		{
 			"forward slash escaped",
