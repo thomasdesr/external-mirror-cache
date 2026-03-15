@@ -19,6 +19,14 @@ repos:
         types: [go]
         pass_filenames: false
 
+      - id: go-test
+        name: go test
+        entry: go test ./...
+        language: system
+        types: [go]
+        pass_filenames: false
+        stages: [pre-push, manual]
+
   - repo: https://github.com/golangci/golangci-lint
     rev: v2.9.0
     hooks:
