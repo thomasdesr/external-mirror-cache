@@ -85,9 +85,10 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // If content is already cached and upstream returns 304, skips re-upload.
 func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (string, error) {
 	logger := reqlog.FromContext(ctx)
+	key := CacheKey{URL: target}
 
 	// Check cache for conditional request headers
-	cachedHeaders, err := m.cache.Head(ctx, target)
+	cachedHeaders, err := m.cache.Head(ctx, key)
 	if err != nil {
 		logger.Warn("cache head error", "target", target.String(), "error", err)
 
@@ -112,7 +113,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 		if cachedHeaders != nil && m.fallback.ShouldFallback(err, 0) {
 			logger.Warn("upstream error, serving stale", "target", target.String(), "error", err)
 
-			return m.presign(ctx, target)
+			return m.presign(ctx, key)
 		}
 
 		return "", errorutil.Wrapf(err, "fetch %s (no cache available)", target)
@@ -124,7 +125,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 	if resp.StatusCode == http.StatusNotModified {
 		logger.Info("upstream returned 304, using cached content", "target", target.String())
 
-		return m.presign(ctx, target)
+		return m.presign(ctx, key)
 	}
 
 	// Non-200 responses - check fallback policy
@@ -132,27 +133,27 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, target *url.URL) (s
 		if cachedHeaders != nil && m.fallback.ShouldFallback(nil, resp.StatusCode) {
 			logger.Warn("upstream error status, serving stale", "target", target.String(), "status", resp.StatusCode)
 
-			return m.presign(ctx, target)
+			return m.presign(ctx, key)
 		}
 
 		return "", &upstreamError{StatusCode: resp.StatusCode, URL: target.String()}
 	}
 
 	// 200 OK - stream to cache
-	err = m.cache.Put(ctx, target, resp.Header, bufio.NewReader(resp.Body))
+	err = m.cache.Put(ctx, key, resp.Header, bufio.NewReader(resp.Body))
 	if err != nil {
 		return "", errorutil.Wrapf(err, "cache %s", target)
 	}
 
 	logger.Debug("cached upstream response", "target", target.String())
 
-	return m.presign(ctx, target)
+	return m.presign(ctx, key)
 }
 
-func (m *cacheMiddleware) presign(ctx context.Context, target *url.URL) (string, error) {
-	u, err := m.cache.GetPresignedURL(ctx, target)
+func (m *cacheMiddleware) presign(ctx context.Context, key CacheKey) (string, error) {
+	u, err := m.cache.GetPresignedURL(ctx, key)
 	if err != nil {
-		return "", errorutil.Wrapf(err, "presign %s", target)
+		return "", errorutil.Wrapf(err, "presign %s", key.URL)
 	}
 
 	return u, nil

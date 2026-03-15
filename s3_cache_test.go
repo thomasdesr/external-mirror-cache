@@ -34,8 +34,8 @@ func TestS3PathForIsPure(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := genURL().Draw(t, "url")
 
-		path1 := cache.s3PathFor(u)
-		path2 := cache.s3PathFor(u)
+		path1 := cache.s3PathFor(CacheKey{URL: u})
+		path2 := cache.s3PathFor(CacheKey{URL: u})
 
 		if path1 != path2 {
 			t.Fatalf("s3PathFor is not pure: %q != %q for URL %v", path1, path2, u)
@@ -50,8 +50,8 @@ func TestS3PathForDeterministic(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := genURL().Draw(t, "url")
 
-		path1 := cache1.s3PathFor(u)
-		path2 := cache2.s3PathFor(u)
+		path1 := cache1.s3PathFor(CacheKey{URL: u})
+		path2 := cache2.s3PathFor(CacheKey{URL: u})
 
 		if path1 != path2 {
 			t.Fatalf("s3PathFor is not deterministic across instances: %q != %q", path1, path2)
@@ -68,7 +68,7 @@ func TestS3PathForContainsHostAndPath(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		u := genURL().Draw(t, "url")
 
-		path := cache.s3PathFor(u)
+		path := cache.s3PathFor(CacheKey{URL: u})
 
 		if len(path) == 0 {
 			t.Fatal("s3PathFor returned empty string")
@@ -103,7 +103,7 @@ func TestS3PathForLeadingSlashStripped(t *testing.T) {
 			Path:   tc.input,
 		}
 
-		got := cache.s3PathFor(u)
+		got := cache.s3PathFor(CacheKey{URL: u})
 		if got != tc.expected {
 			t.Errorf("s3PathFor(%v) = %q, want %q", u, got, tc.expected)
 		}
@@ -134,7 +134,7 @@ func TestS3PathForIncludesQuery(t *testing.T) {
 			RawQuery: tc.query,
 		}
 
-		got := cache.s3PathFor(u)
+		got := cache.s3PathFor(CacheKey{URL: u})
 		if got != tc.expected {
 			t.Errorf("s3PathFor(%v) = %q, want %q", u, got, tc.expected)
 		}

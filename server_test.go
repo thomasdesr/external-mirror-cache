@@ -32,11 +32,11 @@ func newFakeCache() *fakeCache {
 	return &fakeCache{entries: make(map[string]*cacheEntry)}
 }
 
-func (c *fakeCache) Head(ctx context.Context, u *url.URL) (http.Header, error) {
+func (c *fakeCache) Head(ctx context.Context, key CacheKey) (http.Header, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
-	entry, ok := c.entries[u.String()]
+	entry, ok := c.entries[key.String()]
 	if !ok {
 		return nil, nil //nolint:nilnil // cache interface contract
 	}
@@ -44,11 +44,11 @@ func (c *fakeCache) Head(ctx context.Context, u *url.URL) (http.Header, error) {
 	return entry.headers.Clone(), nil
 }
 
-func (c *fakeCache) GetPresignedURL(ctx context.Context, u *url.URL) (string, error) {
-	return "http://fake-s3/" + u.Host + u.Path, nil
+func (c *fakeCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, error) {
+	return "http://fake-s3/" + key.URL.Host + key.URL.Path, nil
 }
 
-func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, body io.Reader) error {
+func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, body io.Reader) error {
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -57,7 +57,7 @@ func (c *fakeCache) Put(ctx context.Context, u *url.URL, headers http.Header, bo
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.entries[u.String()] = &cacheEntry{
+	c.entries[key.String()] = &cacheEntry{
 		headers: headers.Clone(),
 		body:    data,
 	}
