@@ -7,6 +7,8 @@ import (
 	"testing"
 )
 
+var hexIDRegex = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
 // TestNewRequestIDLength verifies that NewRequestID generates 16-character hex strings.
 func TestNewRequestIDLength(t *testing.T) {
 	id := NewRequestID()
@@ -15,7 +17,7 @@ func TestNewRequestIDLength(t *testing.T) {
 	}
 
 	// Verify it's valid hex
-	if !regexp.MustCompile(`^[0-9a-f]{16}$`).MatchString(id) {
+	if !hexIDRegex.MatchString(id) {
 		t.Errorf("expected valid hex, got: %q", id)
 	}
 }

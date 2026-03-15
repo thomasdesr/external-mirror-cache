@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 )
 
 // fakeCache is an in-memory httpCache for testing.
@@ -913,5 +918,121 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 
 	if resp2.StatusCode != http.StatusSeeOther {
 		t.Errorf("expected 303 redirect (stale fallback on conn error), got %d", resp2.StatusCode)
+	}
+}
+
+// TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
+func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
+	var buf bytes.Buffer
+	oldDefault := slog.Default()
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	// Set up JSON logging to capture all logs
+	opts := &slog.HandlerOptions{Level: slog.LevelDebug}
+	handler := slog.NewJSONHandler(&buf, opts)
+	slog.SetDefault(slog.New(handler))
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("test content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	// Create proxy with reqlog middleware to capture request logs
+	cacheHandler := &cacheMiddleware{
+		cache:    cache,
+		client:   upstream.Client(),
+		fallback: FallbackPolicy{},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/test.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Make a request
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	// Parse log output
+	logLines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	if len(logLines) < 2 {
+		t.Fatalf("expected at least 2 log lines (request start and end), got %d", len(logLines))
+	}
+
+	// Check request started log
+	var requestStartLog map[string]interface{}
+	if err := json.Unmarshal(logLines[0], &requestStartLog); err != nil {
+		t.Fatalf("failed to parse first log line: %v", err)
+	}
+
+	if requestStartLog["msg"] != "request started" {
+		t.Errorf("expected 'request started', got %v", requestStartLog["msg"])
+	}
+
+	// Verify request_id is present
+	if _, hasRequestID := requestStartLog["request_id"]; !hasRequestID {
+		t.Error("expected request_id in request start log")
+	}
+
+	// Check request completed log (last line)
+	var requestEndLog map[string]interface{}
+	if err := json.Unmarshal(logLines[len(logLines)-1], &requestEndLog); err != nil {
+		t.Fatalf("failed to parse last log line: %v", err)
+	}
+
+	if requestEndLog["msg"] != "request completed" {
+		t.Errorf("expected 'request completed', got %v", requestEndLog["msg"])
+	}
+
+	// Verify request_id matches in end log
+	if requestEndLog["request_id"] != requestStartLog["request_id"] {
+		t.Error("request_id should be consistent across request start and end")
+	}
+
+	// Verify status and duration in end log
+	if status, ok := requestEndLog["status"].(float64); !ok || int(status) != http.StatusSeeOther {
+		t.Errorf("expected status 303 in request end, got %v", requestEndLog["status"])
+	}
+
+	if _, hasDuration := requestEndLog["duration"]; !hasDuration {
+		t.Error("expected duration in request completed log")
+	}
+
+	// Verify that request_id appears in multiple logs (from request lifecycle)
+	// This demonstrates structured logging is working across the request
+	requestIDCount := 0
+	for _, line := range logLines {
+		var logRecord map[string]interface{}
+		if err := json.Unmarshal(line, &logRecord); err != nil {
+			continue
+		}
+
+		// Count how many logs have the request_id (should be at least 2: start and end)
+		if _, hasRequestID := logRecord["request_id"]; hasRequestID {
+			requestIDCount++
+		}
+	}
+
+	// At minimum, verify request_id appears in multiple logs (showing structured logging works)
+	if requestIDCount < 2 {
+		t.Errorf("expected request_id in at least 2 logs (start and end), found in %d logs", requestIDCount)
 	}
 }

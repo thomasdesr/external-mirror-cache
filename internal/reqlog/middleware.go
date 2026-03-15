@@ -55,3 +55,7 @@ func (w *statusWriter) Write(b []byte) (int, error) {
 
 	return w.ResponseWriter.Write(b)
 }
+
+func (w *statusWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
