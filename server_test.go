@@ -1369,6 +1369,178 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	}
 }
 
+// Unit tests for ociAwareKeyFunc (AC2.1, AC2.2)
+
+func TestOCIAwareKeyFunc_OCI_IncludesAccept(t *testing.T) {
+	// AC2.1: OCI path with Accept header includes Accept in CacheKey.Variant
+	u, _ := url.Parse("https://gcr.io/v2/library/test/manifests/latest")
+	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+	req.Header.Set("Accept", "application/vnd.oci.image.index.v1+json")
+
+	key := ociAwareKeyFunc(u, req)
+
+	if key.Variant != "application/vnd.oci.image.index.v1+json" {
+		t.Errorf("expected variant %q, got %q", "application/vnd.oci.image.index.v1+json", key.Variant)
+	}
+
+	if key.URL != u {
+		t.Errorf("expected URL to be preserved")
+	}
+}
+
+func TestOCIAwareKeyFunc_NonOCI_IgnoresAccept(t *testing.T) {
+	// AC2.2: Non-OCI path produces CacheKey with empty Variant regardless of Accept header
+	u, _ := url.Parse("https://example.com/file.txt")
+	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+
+	key := ociAwareKeyFunc(u, req)
+
+	if key.Variant != "" {
+		t.Errorf("expected empty variant for non-OCI path, got %q", key.Variant)
+	}
+
+	if key.URL != u {
+		t.Errorf("expected URL to be preserved")
+	}
+}
+
+func TestOCIAwareKeyFunc_OCI_NoAcceptHeader(t *testing.T) {
+	// Verify that OCI path with no Accept header produces empty variant
+	u, _ := url.Parse("https://gcr.io/v2/library/test/manifests/latest")
+	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+	// No Accept header set
+
+	key := ociAwareKeyFunc(u, req)
+
+	if key.Variant != "" {
+		t.Errorf("expected empty variant when Accept header absent, got %q", key.Variant)
+	}
+}
+
+// Integration tests for Accept forwarding (AC2.3, AC2.4)
+
+func TestIntegration_AcceptForwarding_OCI_WithAccept(t *testing.T) {
+	// AC2.3: Client Accept header is forwarded to upstream for OCI paths
+	var receivedAccept string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAccept = r.Header.Get("Accept")
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("manifest content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	if receivedAccept != "application/vnd.docker.distribution.manifest.v2+json" {
+		t.Errorf("expected upstream to receive Accept header, got %q", receivedAccept)
+	}
+}
+
+func TestIntegration_AcceptForwarding_OCI_NoAccept(t *testing.T) {
+	// AC2.4: Proxy does not inject default Accept when client omits it
+	var receivedAccept string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAccept = r.Header.Get("Accept")
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("manifest content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// Request without Accept header
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	if receivedAccept != "" {
+		t.Errorf("expected no Accept header forwarded, but upstream received %q", receivedAccept)
+	}
+}
+
+func TestIntegration_AcceptForwarding_NonOCI_WithAccept(t *testing.T) {
+	// Accept should be forwarded even for non-OCI paths (passthrough)
+	var receivedAccept string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAccept = r.Header.Get("Accept")
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("file content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/file.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req.Header.Set("Accept", "text/plain")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	if receivedAccept != "text/plain" {
+		t.Errorf("expected upstream to receive Accept header for non-OCI path, got %q", receivedAccept)
+	}
+}
+
 // TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
 func TestIntegration_StructuredLoggingAttributes(t *testing.T) {
 	var buf bytes.Buffer
