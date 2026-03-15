@@ -35,8 +35,7 @@ func TestMiddlewareLogsRequestStart(t *testing.T) {
 	var buf bytes.Buffer
 	oldDefault := slog.Default()
 	defer func() {
-		// We can't easily restore slog.Default, but tests should be independent
-		_ = oldDefault
+		slog.SetDefault(oldDefault)
 	}()
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
@@ -90,7 +89,7 @@ func TestMiddlewareLogsRequestEnd(t *testing.T) {
 	var buf bytes.Buffer
 	oldDefault := slog.Default()
 	defer func() {
-		_ = oldDefault
+		slog.SetDefault(oldDefault)
 	}()
 
 	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, nil)))
