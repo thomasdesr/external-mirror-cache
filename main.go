@@ -130,6 +130,7 @@ func run() error {
 			On5xx:             *staleOn5xx,
 			OnAnyError:        *staleOnAnyError,
 		},
+		keyFunc: ociAwareKeyFunc,
 	}
 
 	ln, err := getListener(*listen)

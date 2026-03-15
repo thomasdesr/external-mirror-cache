@@ -86,6 +86,7 @@ func newTestServerWithFallback(upstream *httptest.Server, cache *fakeCache, fall
 		cache:    cache,
 		client:   upstreamClient,
 		fallback: fallback,
+		keyFunc:  ociAwareKeyFunc,
 	}
 
 	return httptest.NewServer(handler)
