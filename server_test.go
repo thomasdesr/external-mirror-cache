@@ -921,7 +921,9 @@ func TestIntegration_OCIAuth_TransparentTokenResolution(t *testing.T) {
 		},
 	}
 
-	resp, err := client.Get(proxy.URL + proxyPath)
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	resp, err := client.Do(req)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
@@ -941,9 +943,10 @@ func TestIntegration_OCIAuth_TransparentTokenResolution(t *testing.T) {
 
 	// Verify content was cached with correct ETag
 	upstreamURL, _ := url.Parse(upstream.URL)
-	cachedURL := "https://" + upstreamURL.Host + "/v2/library/test/manifests/latest"
+	baseCachedURL := "https://" + upstreamURL.Host + "/v2/library/test/manifests/latest"
+	cacheKey := baseCachedURL + "\x00" + "application/vnd.docker.distribution.manifest.v2+json"
 
-	entry := cache.get(cachedURL)
+	entry := cache.get(cacheKey)
 	if entry == nil {
 		t.Fatal("expected manifest to be cached")
 	}
@@ -1073,7 +1076,9 @@ func TestIntegration_OCIAuth_CacheRevalidation(t *testing.T) {
 	}
 
 	// First request: initial fetch, populates cache
-	resp1, err := client.Get(proxy.URL + proxyPath)
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	resp1, err := client.Do(req1)
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
@@ -1089,7 +1094,9 @@ func TestIntegration_OCIAuth_CacheRevalidation(t *testing.T) {
 	}
 
 	// Second request: should use cached token and send If-None-Match to upstream
-	resp2, err := client.Get(proxy.URL + proxyPath)
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", "application/vnd.docker.distribution.manifest.v2+json")
+	resp2, err := client.Do(req2)
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
@@ -1270,7 +1277,9 @@ func TestIntegration_OCIAuth_GCRDistrolessDigest(t *testing.T) {
 	}
 
 	// First request: discovery (401 → token fetch → retry with token → 200 → cached)
-	resp1, err := client.Get(proxy.URL + proxyPath)
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
+	resp1, err := client.Do(req1)
 	if err != nil {
 		t.Fatalf("first request failed: %v", err)
 	}
@@ -1282,9 +1291,10 @@ func TestIntegration_OCIAuth_GCRDistrolessDigest(t *testing.T) {
 
 	// Verify cached with correct key (contains colon from sha256:)
 	upstreamURL, _ := url.Parse(upstream.URL)
-	cachedURL := "https://" + upstreamURL.Host + "/v2/distroless/base/manifests/" + digest
+	baseCachedURL := "https://" + upstreamURL.Host + "/v2/distroless/base/manifests/" + digest
+	cacheKey := baseCachedURL + "\x00" + "application/vnd.oci.image.manifest.v1+json"
 
-	entry := cache.get(cachedURL)
+	entry := cache.get(cacheKey)
 	if entry == nil {
 		t.Fatal("expected manifest to be cached")
 	}
@@ -1298,7 +1308,9 @@ func TestIntegration_OCIAuth_GCRDistrolessDigest(t *testing.T) {
 	}
 
 	// Second request: proactive token + conditional request → 304 → serve from cache
-	resp2, err := client.Get(proxy.URL + proxyPath)
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", "application/vnd.oci.image.manifest.v1+json")
+	resp2, err := client.Do(req2)
 	if err != nil {
 		t.Fatalf("second request failed: %v", err)
 	}
@@ -1709,8 +1721,6 @@ func TestIntegration_SingleflightDedup_DifferentAccept(t *testing.T) {
 	}
 }
 
-// Task 1: TestIntegration_OCIAccept_DifferentAcceptSeparateCacheEntries (AC4.1)
-
 func TestIntegration_OCIAccept_DifferentAcceptSeparateCacheEntries(t *testing.T) {
 	// AC4.1: Two OCI requests with different Accept headers produce separate cache entries
 	var upstreamHits atomic.Int32
@@ -1827,8 +1837,6 @@ func TestIntegration_OCIAccept_DifferentAcceptSeparateCacheEntries(t *testing.T)
 	}
 }
 
-// Task 2: TestIntegration_OCIAccept_SameAcceptCacheHit (AC4.2)
-
 func TestIntegration_OCIAccept_SameAcceptCacheHit(t *testing.T) {
 	// AC4.2: Second request with the same Accept header must hit cache
 	var (
@@ -1919,8 +1927,6 @@ func TestIntegration_OCIAccept_SameAcceptCacheHit(t *testing.T) {
 		t.Fatalf("expected at most 1 token endpoint call, got %d", tokenEndpointCalls.Load())
 	}
 }
-
-// Task 3: TestIntegration_OCIAccept_CacheRevalidationWithAcceptKey (AC4.3)
 
 func TestIntegration_OCIAccept_CacheRevalidationWithAcceptKey(t *testing.T) {
 	// AC4.3: Cache revalidation must use the correct ETag from the Accept-specific cache entry
@@ -2052,25 +2058,84 @@ func TestIntegration_OCIAccept_CacheRevalidationWithAcceptKey(t *testing.T) {
 			len(receivedETags), receivedETags)
 	}
 
-	// Check that we got both etags (order may vary depending on scheduling)
-	hasEtagA := false
-	hasEtagB := false
-	for _, etag := range receivedETags {
-		if etag == `"etag-a"` {
-			hasEtagA = true
+	// Requests are sequential and deterministic, so order is guaranteed
+	if receivedETags[0] != `"etag-a"` {
+		t.Errorf("expected first If-None-Match to be %q, got %q",
+			`"etag-a"`, receivedETags[0])
+	}
+	if receivedETags[1] != `"etag-b"` {
+		t.Errorf("expected second If-None-Match to be %q, got %q",
+			`"etag-b"`, receivedETags[1])
+	}
+}
+
+// TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
+func TestIntegration_NonOCI_AcceptIgnoredInCacheKey(t *testing.T) {
+	// AC4.4: Non-OCI requests with different Accept headers share the same cache entry
+	var upstreamHits atomic.Int32
+
+	// Standard upstream server (no OCI auth)
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		// Check for conditional request
+		if r.Header.Get("If-None-Match") == `"file-etag"` {
+			w.WriteHeader(http.StatusNotModified)
+			return
 		}
-		if etag == `"etag-b"` {
-			hasEtagB = true
-		}
+
+		w.Header().Set("ETag", `"file-etag"`)
+		w.Header().Set("Content-Type", "text/plain")
+		w.Write([]byte("file content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/file.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
 	}
 
-	if !hasEtagA {
-		t.Errorf("expected If-None-Match %q to be sent for format A, but it wasn't in %v",
-			`"etag-a"`, receivedETags)
+	// First request with Accept: text/html
+	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req1.Header.Set("Accept", "text/html")
+	resp1, err := client.Do(req1)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
 	}
-	if !hasEtagB {
-		t.Errorf("expected If-None-Match %q to be sent for format B, but it wasn't in %v",
-			`"etag-b"`, receivedETags)
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	if upstreamHits.Load() != 1 {
+		t.Fatalf("after first request: expected 1 upstream hit, got %d", upstreamHits.Load())
+	}
+
+	// Second request with different Accept: application/json (should use same cache entry)
+	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req2.Header.Set("Accept", "application/json")
+	resp2, err := client.Do(req2)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
+	}
+
+	// Verify upstream was hit twice total (initial fetch + conditional revalidation)
+	// NOT three times, which would happen if Accept caused a separate cache entry
+	if upstreamHits.Load() != 2 {
+		t.Fatalf("expected 2 upstream hits (same cache entry), got %d", upstreamHits.Load())
 	}
 }
 
