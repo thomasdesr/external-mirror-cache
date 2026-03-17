@@ -1,0 +1,54 @@
+[[repos]]
+repo = "https://github.com/pre-commit/pre-commit-hooks"
+rev = "v6.0.0"
+hooks = [
+  { id = "check-yaml" },
+  { id = "check-json" },
+  { id = "check-merge-conflict" },
+  { id = "check-added-large-files" },
+  { id = "end-of-file-fixer" },
+  { id = "trailing-whitespace" },
+  { id = "detect-private-key" },
+]
+
+[[repos]]
+repo = "local"
+
+[[repos.hooks]]
+id = "go-mod-tidy"
+name = "go mod tidy"
+entry = "go mod tidy"
+language = "system"
+types = ["go"]
+pass_filenames = false
+
+[[repos.hooks]]
+id = "go-test"
+name = "go test"
+entry = "go test ./..."
+language = "system"
+types = ["go"]
+pass_filenames = false
+stages = ["pre-push", "manual"]
+priority = 100
+
+[[repos]]
+repo = "https://github.com/golangci/golangci-lint"
+rev = "v2.9.0"
+
+[[repos.hooks]]
+id = "golangci-lint"
+args = ["--fix"]
+stages = ["pre-commit"]
+priority = 100
+
+[[repos.hooks]]
+id = "golangci-lint-full"
+args = ["--fix"]
+stages = ["pre-push", "manual"]
+priority = 100
+
+[[repos]]
+repo = "https://github.com/zizmorcore/zizmor-pre-commit"
+rev = "v1.22.0"
+hooks = [{ id = "zizmor", args = ["--pedantic"] }]
