@@ -171,15 +171,35 @@ func TestParseOCIAuthChallenge(t *testing.T) {
 			headers: map[string][]string{
 				"Www-Authenticate": {`Bearer realm="https://auth.example.com/token",service="registry.example.com"`},
 			},
-			ok: false,
+			expected: ociAuthChallenge{
+				Realm:   "https://auth.example.com/token",
+				Service: testService,
+			},
+			ok: true,
 		},
 		{
-			name:   "Bearer with realm and scope but no service",
+			name:   "Bearer with realm and scope but no service (nvcr.io-style)",
 			status: 401,
 			headers: map[string][]string{
 				"Www-Authenticate": {`Bearer realm="https://auth.example.com/token",scope="repository:test:pull"`},
 			},
-			ok: false,
+			expected: ociAuthChallenge{
+				Realm: "https://auth.example.com/token",
+				Scope: "repository:test:pull",
+			},
+			ok: true,
+		},
+		{
+			name:   "nvcr.io exact challenge format",
+			status: 401,
+			headers: map[string][]string{
+				"Www-Authenticate": {`Bearer realm="https://nvcr.io/proxy_auth",scope="repository:nvidia/k8s/dcgm-exporter:pull"`},
+			},
+			expected: ociAuthChallenge{
+				Realm: "https://nvcr.io/proxy_auth",
+				Scope: "repository:nvidia/k8s/dcgm-exporter:pull",
+			},
+			ok: true,
 		},
 		{
 			name:   "Bearer with only realm",
@@ -187,7 +207,10 @@ func TestParseOCIAuthChallenge(t *testing.T) {
 			headers: map[string][]string{
 				"Www-Authenticate": {`Bearer realm="https://auth.example.com/token"`},
 			},
-			ok: false,
+			expected: ociAuthChallenge{
+				Realm: "https://auth.example.com/token",
+			},
+			ok: true,
 		},
 		{
 			name:   "whitespace before Bearer scheme",
@@ -704,6 +727,43 @@ func TestFetchToken_RealmWithExistingQueryParams(t *testing.T) {
 
 	if token != "test-token" {
 		t.Errorf("token mismatch: got %q, want %q", token, "test-token")
+	}
+}
+
+// TestFetchToken_EmptyServiceOmitsParam tests that fetchToken omits the service
+// query parameter when the challenge has no service (e.g., nvcr.io).
+func TestFetchToken_EmptyServiceOmitsParam(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// service param must NOT be present
+		if r.URL.Query().Has("service") {
+			t.Errorf("service query param should be absent, got %q", r.URL.Query().Get("service"))
+		}
+
+		if r.URL.Query().Get("scope") != "repository:nvidia/k8s/dcgm-exporter:pull" {
+			t.Errorf("scope param mismatch: got %q", r.URL.Query().Get("scope"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"token":"nvcr-token","expires_in":3600}`))
+	}))
+	defer server.Close()
+
+	transport := server.Client().Transport
+	challenge := ociAuthChallenge{
+		Realm: server.URL,
+		Scope: "repository:nvidia/k8s/dcgm-exporter:pull",
+	}
+
+	ctx := testContext(t)
+
+	token, _, err := fetchToken(ctx, transport, challenge)
+	if err != nil {
+		t.Fatalf("fetchToken failed: %v", err)
+	}
+
+	if token != "nvcr-token" {
+		t.Errorf("token mismatch: got %q, want %q", token, "nvcr-token")
 	}
 }
 
@@ -1484,5 +1544,83 @@ func TestOCIAuthTransport_ProactiveFailureNoDoubleFetch(t *testing.T) {
 	// not twice (proactive + discovery would be a double-fetch bug)
 	if got := tokenCalls.Load(); got != 1 {
 		t.Errorf("token endpoint called %d times, want 1 (double-fetch bug)", got)
+	}
+}
+
+// TestOCIAuthTransport_DiscoveryNoService tests the full discovery flow for registries
+// like nvcr.io that omit the service parameter from their Bearer challenge.
+func TestOCIAuthTransport_DiscoveryNoService(t *testing.T) {
+	tokenCalls := atomic.Int32{}
+
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenCalls.Add(1)
+
+		// service param must NOT be present
+		if r.URL.Query().Has("service") {
+			t.Errorf("token: service query param should be absent, got %q", r.URL.Query().Get("service"))
+		}
+
+		if r.URL.Query().Get("scope") != "repository:nvidia/k8s/dcgm-exporter:pull" {
+			t.Errorf("token: scope param mismatch: got %q", r.URL.Query().Get("scope"))
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"token":"nvcr-token","expires_in":3600}`))
+	}))
+	defer tokenServer.Close()
+
+	upstreamCalls := atomic.Int32{}
+
+	upstreamServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls := upstreamCalls.Add(1)
+
+		if calls == 1 {
+			// First call: bare request, return 401 with nvcr.io-style challenge (no service)
+			w.Header().Set("Www-Authenticate",
+				`Bearer realm="`+tokenServer.URL+`",scope="repository:nvidia/k8s/dcgm-exporter:pull"`)
+			w.WriteHeader(http.StatusUnauthorized)
+
+			return
+		}
+
+		// Second call: should have Authorization header
+		auth := r.Header.Get("Authorization")
+		if auth != "Bearer nvcr-token" {
+			t.Errorf("upstream call 2: expected 'Bearer nvcr-token', got %q", auth)
+		}
+
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("manifest content"))
+	}))
+	defer upstreamServer.Close()
+
+	transport := newOCIAuthTransport(upstreamServer.Client().Transport)
+	defer transport.Close()
+
+	ctx := testContext(t)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		upstreamServer.URL+"/v2/nvidia/k8s/dcgm-exporter/manifests/sha256:771a9b002f110ee687cc8ec98163966730e0faeaf5ee1cd0428309564b2530a9", nil)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("RoundTrip failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200, got %d", resp.StatusCode)
+	}
+
+	if upstreamCalls.Load() != 2 {
+		t.Errorf("upstream received %d calls, want 2", upstreamCalls.Load())
+	}
+
+	if tokenCalls.Load() != 1 {
+		t.Errorf("token endpoint received %d calls, want 1", tokenCalls.Load())
 	}
 }
