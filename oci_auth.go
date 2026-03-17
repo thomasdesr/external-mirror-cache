@@ -65,22 +65,18 @@ func parseOCIAuthChallenge(resp *http.Response) (ociAuthChallenge, bool) {
 		// Parse the challenge parameters
 		challenge := parseAuthChallengeParams(remainder)
 
-		// Check that all required fields are present
+		// realm is required; service and scope are optional per the
+		// Docker Registry Token Auth spec and RFC 6750.
 		realm, hasRealm := challenge["realm"]
-		service, hasService := challenge["service"]
-		scope, hasScope := challenge["scope"]
-
-		if hasRealm && hasService && hasScope {
-			return ociAuthChallenge{
-				Realm:   realm,
-				Service: service,
-				Scope:   scope,
-			}, true
+		if !hasRealm {
+			return ociAuthChallenge{}, false
 		}
 
-		// If this Bearer challenge is missing required fields, don't continue
-		// Return immediately with false
-		return ociAuthChallenge{}, false
+		return ociAuthChallenge{
+			Realm:   realm,
+			Service: challenge["service"],
+			Scope:   challenge["scope"],
+		}, true
 	}
 
 	return ociAuthChallenge{}, false
@@ -279,8 +275,14 @@ func fetchToken(ctx context.Context, base http.RoundTripper, challenge ociAuthCh
 	}
 
 	q := realmURL.Query()
-	q.Set("service", challenge.Service)
-	q.Set("scope", challenge.Scope)
+	if challenge.Service != "" {
+		q.Set("service", challenge.Service)
+	}
+
+	if challenge.Scope != "" {
+		q.Set("scope", challenge.Scope)
+	}
+
 	realmURL.RawQuery = q.Encode()
 	tokenURL := realmURL.String()
 
