@@ -17,10 +17,19 @@ import (
 	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 )
 
+// s3Uploader is the subset of transfermanager.Client that s3HTTPCache needs.
+type s3Uploader interface {
+	UploadObject(
+		ctx context.Context,
+		input *transfermanager.UploadObjectInput,
+		opts ...func(*transfermanager.Options),
+	) (*transfermanager.UploadObjectOutput, error)
+}
+
 type s3HTTPCache struct {
 	s3c  *s3.Client
 	s3pc *s3.PresignClient
-	s3u  *transfermanager.Client
+	s3u  s3Uploader
 
 	bucket string
 	prefix string
@@ -86,11 +95,17 @@ func (c *s3HTTPCache) Put(ctx context.Context, key CacheKey, headers http.Header
 
 	logger.Debug("uploading to cache", "bucket", c.bucket, "key", objectPath)
 
+	var contentType *string
+	if ct := headers.Get("Content-Type"); ct != "" {
+		contentType = aws.String(ct)
+	}
+
 	_, err = c.s3u.UploadObject(ctx, &transfermanager.UploadObjectInput{
-		Bucket:   aws.String(c.bucket),
-		Key:      aws.String(objectPath),
-		Body:     body,
-		Metadata: metadata,
+		Bucket:      aws.String(c.bucket),
+		Key:         aws.String(objectPath),
+		Body:        body,
+		Metadata:    metadata,
+		ContentType: contentType,
 	})
 	if err != nil {
 		return errorutil.Wrapf(err, "UploadObject(%s, %s)", c.bucket, objectPath)
