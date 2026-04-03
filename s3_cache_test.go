@@ -1,12 +1,65 @@
 package main
 
 import (
+	"context"
+	"net/http"
 	"net/url"
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+
 	"pgregory.net/rapid"
 )
+
+// spyUploader records the UploadObjectInput it receives.
+type spyUploader struct {
+	lastInput *transfermanager.UploadObjectInput
+}
+
+func (s *spyUploader) UploadObject(
+	_ context.Context,
+	input *transfermanager.UploadObjectInput,
+	_ ...func(*transfermanager.Options),
+) (*transfermanager.UploadObjectOutput, error) {
+	s.lastInput = input
+
+	return &transfermanager.UploadObjectOutput{}, nil
+}
+
+func TestPutSetsContentTypeOnUpload(t *testing.T) {
+	spy := &spyUploader{}
+	cache := &s3HTTPCache{
+		s3u:    spy,
+		bucket: "test-bucket",
+		prefix: "cache",
+	}
+
+	headers := http.Header{
+		"Content-Type": []string{"text/html"},
+		"ETag":         []string{`"abc"`},
+	}
+
+	key := CacheKey{URL: &url.URL{
+		Scheme: "https",
+		Host:   "pypi.org",
+		Path:   "/simple/azure-mgmt-dns/",
+	}}
+
+	err := cache.Put(context.Background(), key, headers, strings.NewReader("<html>packages</html>"))
+	if err != nil {
+		t.Fatalf("Put() error: %v", err)
+	}
+
+	if spy.lastInput.ContentType == nil || *spy.lastInput.ContentType != "text/html" {
+		got := "<nil>"
+		if spy.lastInput.ContentType != nil {
+			got = *spy.lastInput.ContentType
+		}
+
+		t.Errorf("UploadObject ContentType = %s, want %q", got, "text/html")
+	}
+}
 
 // genURL generates valid URLs with scheme, host, path, and optional query.
 func genURL() *rapid.Generator[*url.URL] {
