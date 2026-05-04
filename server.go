@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
 	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
@@ -35,6 +36,11 @@ type cacheMiddleware struct {
 	fallback    FallbackPolicy
 	keyFunc     func(target *url.URL, r *http.Request) CacheKey
 	uploadGroup singleflight.Group[string] // dedupes concurrent requests, returns presigned URL
+
+	// conditionalFetchTimeout bounds the upstream call when we already have
+	// cached content to fall back to. Zero leaves the http.Client's own
+	// timeouts in charge.
+	conditionalFetchTimeout time.Duration
 }
 
 func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -106,7 +112,14 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 
 	logger = logger.With("target", key.URL.String(), "fetch", fetchType)
 
-	req, err := buildUpstreamRequest(ctx, key.URL, accept, cachedHeaders)
+	fetchCtx := ctx
+	if conditionalFetch && m.conditionalFetchTimeout > 0 {
+		var cancel context.CancelFunc
+		fetchCtx, cancel = context.WithTimeout(ctx, m.conditionalFetchTimeout)
+		defer cancel()
+	}
+
+	req, err := buildUpstreamRequest(fetchCtx, key.URL, accept, cachedHeaders)
 	if err != nil {
 		return "", err
 	}

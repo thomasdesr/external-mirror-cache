@@ -1396,6 +1396,76 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 	}
 }
 
+// Regression: when content is already cached and upstream hangs (e.g. TCP
+// black-hole on a broken HTTPS port), the conditional GET must time out fast
+// enough for the fallback path to serve stale before clients hit their own
+// read timeouts.
+func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
+	block := make(chan struct{})
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(_ http.ResponseWriter, _ *http.Request) {
+		<-block
+	}))
+	defer upstream.Close() // unblocks after close(block) below
+	defer close(block)     // releases hung handlers so upstream.Close can return
+
+	cache := newFakeCache()
+
+	upstreamClient := upstream.Client()
+	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
+
+	handler := &cacheMiddleware{
+		cache:                   cache,
+		client:                  upstreamClient,
+		fallback:                FallbackPolicy{OnConnectionError: true},
+		keyFunc:                 ociAwareKeyFunc,
+		conditionalFetchTimeout: 100 * time.Millisecond,
+	}
+
+	proxy := httptest.NewServer(handler)
+	defer proxy.Close()
+
+	upstreamHost, _ := url.Parse(upstream.URL)
+	cachedURL := &url.URL{
+		Scheme: "https",
+		Host:   upstreamHost.Host,
+		Path:   "/cached.deb",
+	}
+
+	if err := cache.Put(context.Background(), CacheKey{URL: cachedURL},
+		http.Header{"Etag": []string{`"v1"`}},
+		bytes.NewReader([]byte("cached body"))); err != nil {
+		t.Fatalf("cache.Put: %v", err)
+	}
+
+	proxyPath := "/" + upstreamHost.Host + "/cached.deb"
+
+	client := &http.Client{
+		Timeout: 3 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	start := time.Now()
+
+	resp, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("client.Get: %v", err)
+	}
+	defer resp.Body.Close() //nolint:errcheck // test cleanup
+
+	elapsed := time.Since(start)
+
+	if got, want := resp.StatusCode, http.StatusSeeOther; got != want {
+		t.Errorf("status code = %d, want %d (stale fallback)", got, want)
+	}
+
+	if elapsed > 1*time.Second {
+		t.Errorf("fallback took %v, want < 1s (conditionalFetchTimeout=100ms)", elapsed)
+	}
+}
+
 // Unit tests for ociAwareKeyFunc (AC2.1, AC2.2)
 
 func TestOCIAwareKeyFunc_OCI_IncludesAccept(t *testing.T) {
