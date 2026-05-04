@@ -47,6 +47,9 @@ var (
 	staleOnConnectionError = flag.Bool("stale-on-connection-error", true, "serve stale content on connection errors (timeouts, DNS failures)")
 	staleOn5xx             = flag.Bool("stale-on-5xx", true, "serve stale content on upstream 5xx errors")
 	staleOnAnyError        = flag.Bool("stale-on-any-error", false, "serve stale content on any upstream error")
+
+	conditionalFetchTimeout = flag.Duration("conditional-fetch-timeout", 0,
+		"max wait on upstream when content is already cached; 0 (default) leaves http.Client timeouts in charge. Set to a small duration (e.g. 5s) to fall back to stale faster when upstream is unreachable.")
 )
 
 func main() {
@@ -130,7 +133,8 @@ func run() error {
 			On5xx:             *staleOn5xx,
 			OnAnyError:        *staleOnAnyError,
 		},
-		keyFunc: ociAwareKeyFunc,
+		keyFunc:                 ociAwareKeyFunc,
+		conditionalFetchTimeout: *conditionalFetchTimeout,
 	}
 
 	ln, err := getListener(*listen)
