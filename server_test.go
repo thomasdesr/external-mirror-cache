@@ -1399,7 +1399,9 @@ func TestIntegration_FallbackOnConnectionError_WithCache(t *testing.T) {
 // Regression: when content is already cached and upstream hangs (e.g. TCP
 // black-hole on a broken HTTPS port), the conditional GET must time out fast
 // enough for the fallback path to serve stale before clients hit their own
-// read timeouts.
+// read timeouts. The transport's ResponseHeaderTimeout firing produces a
+// net.Error which FallbackPolicy.OnConnectionError catches and routes to the
+// stale-serving path.
 func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 	block := make(chan struct{})
 
@@ -1412,14 +1414,20 @@ func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 	cache := newFakeCache()
 
 	upstreamClient := upstream.Client()
-	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
+
+	upstreamTransport, ok := upstreamClient.Transport.(*http.Transport)
+	if !ok {
+		t.Fatalf("upstream client transport is %T, want *http.Transport", upstreamClient.Transport)
+	}
+
+	upstreamTransport.ResponseHeaderTimeout = 100 * time.Millisecond
+	upstreamClient.Transport = newOCIAuthTransport(upstreamTransport)
 
 	handler := &cacheMiddleware{
-		cache:                   cache,
-		client:                  upstreamClient,
-		fallback:                FallbackPolicy{OnConnectionError: true},
-		keyFunc:                 ociAwareKeyFunc,
-		conditionalFetchTimeout: 100 * time.Millisecond,
+		cache:    cache,
+		client:   upstreamClient,
+		fallback: FallbackPolicy{OnConnectionError: true},
+		keyFunc:  ociAwareKeyFunc,
 	}
 
 	proxy := httptest.NewServer(handler)
@@ -1453,7 +1461,7 @@ func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 	if err != nil {
 		t.Fatalf("client.Get: %v", err)
 	}
-	defer resp.Body.Close() //nolint:errcheck // test cleanup
+	defer resp.Body.Close()
 
 	elapsed := time.Since(start)
 
@@ -1462,7 +1470,7 @@ func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 	}
 
 	if elapsed > 1*time.Second {
-		t.Errorf("fallback took %v, want < 1s (conditionalFetchTimeout=100ms)", elapsed)
+		t.Errorf("fallback took %v, want < 1s (ResponseHeaderTimeout=100ms)", elapsed)
 	}
 }
 

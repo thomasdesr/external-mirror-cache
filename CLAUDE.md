@@ -1,6 +1,6 @@
 # Mirror Cache
 
-Last verified: 2026-03-15
+Last verified: 2026-05-08
 
 ## Scope & Boundaries
 
@@ -92,6 +92,10 @@ Stale-serving flags:
 - `--stale-on-connection-error` (default true)
 - `--stale-on-5xx` (default true)
 - `--stale-on-any-error` (default false)
+
+Upstream timeout flags:
+- `--response-header-timeout` / `MIRROR_CACHE_RESPONSE_HEADER_TIMEOUT` (default `5s`) -- max wait for upstream response headers; conditional fetches fall back to stale on timeout, cache-miss returns 502; `0` disables
+- `--client-timeout` / `MIRROR_CACHE_CLIENT_TIMEOUT` (default `120s`) -- overall `http.Client.Timeout`, bounds total upstream request time including body streaming; `0` disables
 
 ## Logging
 

@@ -48,8 +48,18 @@ var (
 	staleOn5xx             = flag.Bool("stale-on-5xx", true, "serve stale content on upstream 5xx errors")
 	staleOnAnyError        = flag.Bool("stale-on-any-error", false, "serve stale content on any upstream error")
 
-	conditionalFetchTimeout = flag.Duration("conditional-fetch-timeout", 0,
-		"max wait on upstream when content is already cached; 0 (default) leaves http.Client timeouts in charge. Set to a small duration (e.g. 5s) to fall back to stale faster when upstream is unreachable.")
+	clientTimeoutStr = flag.String(
+		"client-timeout",
+		envDefault("MIRROR_CACHE_CLIENT_TIMEOUT", "120s"),
+		"overall http.Client.Timeout; bounds total upstream request time including body streaming; 0 disables (env: MIRROR_CACHE_CLIENT_TIMEOUT)",
+	)
+	responseHeaderTimeoutStr = flag.String(
+		"response-header-timeout",
+		envDefault("MIRROR_CACHE_RESPONSE_HEADER_TIMEOUT", "5s"),
+		"max wait for upstream response headers; on timeout conditional fetches"+
+			" fall back to stale, cache-miss returns 502; 0 disables"+
+			" (env: MIRROR_CACHE_RESPONSE_HEADER_TIMEOUT)",
+	)
 )
 
 func main() {
@@ -61,7 +71,10 @@ func main() {
 	}
 }
 
-var errBucketRequired = errors.New("--bucket or MIRROR_CACHE_BUCKET is required")
+var (
+	errBucketRequired   = errors.New("--bucket or MIRROR_CACHE_BUCKET is required")
+	errNegativeDuration = errors.New("duration must be zero or positive")
+)
 
 func run() error {
 	if err := setupLogging(*logLevel); err != nil {
@@ -72,6 +85,11 @@ func run() error {
 		return errBucketRequired
 	}
 
+	clientTimeout, responseHeaderTimeout, err := parseTimeoutFlags()
+	if err != nil {
+		return err
+	}
+
 	cfg, err := config.LoadDefaultConfig(context.Background(), config.WithEC2IMDSRegion())
 	if err != nil {
 		return errorutil.Wrap(err, "load AWS config")
@@ -79,43 +97,11 @@ func run() error {
 
 	s3c := s3.NewFromConfig(cfg)
 
-	// Upstream fetch transport. Only this client goes through the egress
-	// proxy; AWS SDK traffic (S3, IMDS) uses the default transport directly.
-	transport := http.DefaultTransport.(*http.Transport) //nolint:forcetypeassert // intentional panic
-
-	transport = transport.Clone()
-	transport.Proxy = nil
-
-	if *egressProxy != "" {
-		proxyURL, err := url.Parse(*egressProxy)
-		if err != nil {
-			return errorutil.Wrap(err, "invalid --egress-proxy URL")
-		}
-
-		transport.Proxy = http.ProxyURL(proxyURL)
-
-		slog.Info("upstream requests proxied via egress proxy", "proxy", *egressProxy)
+	client, ociTransport, err := newUpstreamClient(clientTimeout, responseHeaderTimeout)
+	if err != nil {
+		return err
 	}
-
-	transport.DialContext = (&net.Dialer{
-		Timeout: 10 * time.Second,
-	}).DialContext
-	transport.TLSHandshakeTimeout = 10 * time.Second
-	transport.ResponseHeaderTimeout = 30 * time.Second
-	transport.IdleConnTimeout = 90 * time.Second
-
-	ociTransport := newOCIAuthTransport(transport)
 	defer ociTransport.Close()
-
-	client := &http.Client{
-		Transport: ociTransport,
-		Timeout:   5 * time.Minute,
-		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
-			reqlog.FromContext(req.Context()).Debug("following redirect", "url", req.URL.String())
-
-			return nil
-		},
-	}
 
 	s3Cache := &s3HTTPCache{
 		s3c:    s3c,
@@ -133,8 +119,7 @@ func run() error {
 			On5xx:             *staleOn5xx,
 			OnAnyError:        *staleOnAnyError,
 		},
-		keyFunc:                 ociAwareKeyFunc,
-		conditionalFetchTimeout: *conditionalFetchTimeout,
+		keyFunc: ociAwareKeyFunc,
 	}
 
 	ln, err := getListener(*listen)
@@ -157,6 +142,75 @@ func run() error {
 	slog.Info("server stopped")
 
 	return nil
+}
+
+// newUpstreamClient builds the http.Client used for upstream fetches. Only
+// this client goes through the egress proxy; AWS SDK traffic (S3, IMDS) uses
+// the default transport directly. Caller must Close the returned transport.
+func newUpstreamClient(clientTimeout, responseHeaderTimeout time.Duration) (*http.Client, *ociAuthTransport, error) {
+	transport := http.DefaultTransport.(*http.Transport) //nolint:forcetypeassert // intentional panic
+
+	transport = transport.Clone()
+	transport.Proxy = nil
+
+	if *egressProxy != "" {
+		proxyURL, err := url.Parse(*egressProxy)
+		if err != nil {
+			return nil, nil, errorutil.Wrap(err, "invalid --egress-proxy URL")
+		}
+
+		transport.Proxy = http.ProxyURL(proxyURL)
+
+		slog.Info("upstream requests proxied via egress proxy", "proxy", *egressProxy)
+	}
+
+	transport.DialContext = (&net.Dialer{
+		Timeout: 10 * time.Second,
+	}).DialContext
+	transport.TLSHandshakeTimeout = 10 * time.Second
+	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	transport.IdleConnTimeout = 90 * time.Second
+
+	ociTransport := newOCIAuthTransport(transport)
+
+	client := &http.Client{
+		Transport: ociTransport,
+		Timeout:   clientTimeout,
+		CheckRedirect: func(req *http.Request, _ []*http.Request) error {
+			reqlog.FromContext(req.Context()).Debug("following redirect", "url", req.URL.String())
+
+			return nil
+		},
+	}
+
+	return client, ociTransport, nil
+}
+
+func parseTimeoutFlags() (client, responseHeader time.Duration, err error) {
+	client, err = parseDuration(*clientTimeoutStr, "client-timeout")
+	if err != nil {
+		return 0, 0, err
+	}
+
+	responseHeader, err = parseDuration(*responseHeaderTimeoutStr, "response-header-timeout")
+	if err != nil {
+		return 0, 0, err
+	}
+
+	return client, responseHeader, nil
+}
+
+func parseDuration(s, name string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil {
+		return 0, errorutil.Wrapf(err, "invalid --%s value %q", name, s)
+	}
+
+	if d < 0 {
+		return 0, errorutil.Wrapf(errNegativeDuration, "invalid --%s value %q", name, s)
+	}
+
+	return d, nil
 }
 
 func setupLogging(levelStr string) error {
