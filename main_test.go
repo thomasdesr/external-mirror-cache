@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"testing"
+	"time"
 )
 
 // TestLogLevelParsing tests that valid log levels parse without error.
@@ -137,6 +138,40 @@ func TestJSONHandlerOutput(t *testing.T) {
 
 	if _, hasLevel := logRecord["level"]; !hasLevel {
 		t.Error("expected level field in JSON output")
+	}
+}
+
+// TestParseDuration tests the parseDuration helper used for the timeout flags.
+func TestParseDuration(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		flag    string
+		want    time.Duration
+		wantErr bool
+	}{
+		{"zero allowed", "0", "client-timeout", 0, false},
+		{"positive seconds", "5s", "response-header-timeout", 5 * time.Second, false},
+		{"positive minutes", "2m", "client-timeout", 2 * time.Minute, false},
+		{"120 seconds default", "120s", "client-timeout", 120 * time.Second, false},
+		{"5 seconds default", "5s", "response-header-timeout", 5 * time.Second, false},
+		{"negative rejected", "-1s", "client-timeout", 0, true},
+		{"invalid string rejected", "banana", "client-timeout", 0, true},
+		{"empty string rejected", "", "client-timeout", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseDuration(tt.input, tt.flag)
+
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseDuration(%q, %q): got error %v, want error %v", tt.input, tt.flag, err != nil, tt.wantErr)
+			}
+
+			if err == nil && got != tt.want {
+				t.Errorf("parseDuration(%q, %q): got %v, want %v", tt.input, tt.flag, got, tt.want)
+			}
+		})
 	}
 }
 
