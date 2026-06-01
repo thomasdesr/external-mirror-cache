@@ -1,0 +1,72 @@
+name: prek auto-update
+
+# Keeps the pinned hook revisions in prek.toml current. prek hooks are pinned
+# tooling refs -- the same category as the GitHub Actions SHAs Dependabot still
+# bumps -- but Dependabot reads .pre-commit-config.yaml, not prek's native TOML,
+# so prek's own auto-update fills that role on the same weekly cadence.
+#
+# The ref-fetch runs in a gVisor sandbox with no token: prek contacts the hook
+# repos to resolve new revisions, so a malicious upstream response must not reach
+# the PR-write credentials. Only the prek.toml edit persists out; the privileged
+# commit/PR step runs separately on the host. Schedule/dispatch-only, so the
+# sandbox is enforceable (the trusted default-branch workflow defines it, unlike
+# a pull_request gate). See https://words.filippo.io/dependabot/.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday -- offset from the hour and from latest-deps
+  workflow_dispatch:
+
+permissions:
+  contents: read # Clone the repository
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  auto-update:
+    name: Update prek hooks
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create the update branch
+      pull-requests: write # open the PR
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      # prek is installed and run inside the sandbox (latest, like the @latest
+      # tools in latest-deps.yml): the sandbox is the supply-chain control, so a
+      # compromised prek or hook-repo response is confined to a tokenless context
+      # whose only escape is the prek.toml edit we diff before committing.
+      - name: Update hook revisions
+        uses: geomys/sandboxed-step@7d75eb49d17fdeeb3656b3a57d35932d205bcfb9 # v1.2.1
+        with:
+          persist-workspace-changes: "true"
+          run: |
+            curl --proto '=https' --tlsv1.2 -LsSf https://github.com/j178/prek/releases/latest/download/prek-installer.sh | sh
+            export PATH="$HOME/.local/bin:$PATH"
+            prek auto-update --cooldown-days 7
+
+      - name: Open PR if hooks changed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then
+            echo "No hook updates available."
+            exit 0
+          fi
+          branch="prek-auto-update"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch"
+          git commit -am "build(deps): update prek hook revisions"
+          gh auth setup-git
+          git push --force origin "$branch"
+          if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
+            gh pr create --base main --head "$branch" \
+              --title "build(deps): update prek hook revisions" \
+              --body "Automated \`prek auto-update --cooldown-days 7\` run. Bumps pinned hook revisions in \`prek.toml\` published at least 7 days ago." \
+              --label dependencies
+          fi
