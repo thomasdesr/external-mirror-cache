@@ -511,25 +511,15 @@ var _ http.RoundTripper = (*ociAuthTransport)(nil)
 
 // RoundTrip implements http.RoundTripper.
 func (t *ociAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	// Bypass check: if request already has Authorization header, pass through
+	// Bypass: request brought its own auth; OCI auth transport stays out of the way.
 	if req.Header.Get("Authorization") != "" {
-		resp, err := t.base.RoundTrip(req)
-		if err != nil {
-			return nil, errorutil.Wrap(err, "oci auth bypass")
-		}
-
-		return resp, nil
+		return t.base.RoundTrip(req) //nolint:wrapcheck // fork exit does no OCI work; wrapping would misattribute the error
 	}
 
-	// Extract OCI repository once; non-OCI paths pass through directly
+	// Extract OCI repository once; non-OCI paths pass through directly.
 	host, repo, ok := extractOCIRepository(req.URL)
 	if !ok {
-		resp, err := t.base.RoundTrip(req)
-		if err != nil {
-			return nil, errorutil.Wrap(err, "oci auth passthrough")
-		}
-
-		return resp, nil
+		return t.base.RoundTrip(req) //nolint:wrapcheck // fork exit does no OCI work; wrapping would misattribute the error
 	}
 
 	// Try proactive path: if we have a cached challenge for this repository, use it
