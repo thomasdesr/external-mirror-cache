@@ -1,0 +1,51 @@
+name: Latest deps
+
+# Forward-looking compatibility signal: runs the test suite against upstream
+# HEAD on a schedule so dependency breakage surfaces on our timeline rather than
+# when an update is forced on us. Informational only -- never gates a PR, which
+# is why this lives apart from ci.yml. See https://words.filippo.io/dependabot/.
+
+on:
+  schedule:
+    - cron: "22 10 * * 1" # weekly, Monday 10:22 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read # Clone the repository
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # stable catches breakage on the newest Go toolchain; go.mod pins the
+        # version we actually build against.
+        go:
+          - { go-version: stable }
+          - { go-version-file: go.mod }
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+        with:
+          go-version: ${{ matrix.go.go-version }}
+          go-version-file: ${{ matrix.go.go-version-file }}
+          cache: false
+
+      # go get -u pulls untrusted upstream code; gVisor sandboxing keeps that
+      # code away from the runner's ambient credentials.
+      - name: Test against latest deps
+        uses: geomys/sandboxed-step@7d75eb49d17fdeeb3656b3a57d35932d205bcfb9 # v1.2.1
+        with:
+          run: |
+            go get -u -t ./...
+            go test -race ./...
