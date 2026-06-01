@@ -1,12 +1,8 @@
 version: 2
 updates:
-  - package-ecosystem: gomod
-    directory: /
-    schedule:
-      interval: weekly
-    cooldown:
-      default-days: 7
-
+  # Dependabot handles only GitHub Actions SHA bumps. Go modules are delegated
+  # to latest-deps.yml (weekly test vs upstream HEAD) and govulncheck.yml
+  # (security alerts). See https://words.filippo.io/dependabot/.
   - package-ecosystem: github-actions
     directory: /
     schedule:
