@@ -58,7 +58,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	accept := r.Header.Get("Accept")
+	accept := acceptHeader(r)
 	key := m.buildKey(target, r)
 
 	// Singleflight ensures only one request fetches from upstream.
@@ -212,10 +212,22 @@ func (m *cacheMiddleware) buildKey(target *url.URL, r *http.Request) CacheKey {
 // produce an empty variant, preserving URL-only keying.
 func ociAwareKeyFunc(target *url.URL, r *http.Request) CacheKey {
 	if _, _, ok := extractOCIRepository(target); ok {
-		return CacheKey{URL: target, Variant: r.Header.Get("Accept")}
+		return CacheKey{URL: target, Variant: acceptHeader(r)}
 	}
 
 	return CacheKey{URL: target}
+}
+
+// acceptHeader returns the request's complete Accept header set as a single
+// comma-joined value. Clients may send multiple Accept headers -- Bazel's
+// downloader emits Java's default Accept first and appends the real media-type
+// Accept second -- which RFC 9110 §5.3 makes semantically one comma-separated
+// header. Reading only the first value (http.Header.Get) drops media types and
+// breaks strict content negotiation (nvcr.io 404s OCI manifests). The variant
+// and the forwarded value derive from this same join so the cache key matches
+// what is sent upstream.
+func acceptHeader(r *http.Request) string {
+	return strings.Join(r.Header.Values("Accept"), ", ")
 }
 
 // parseTargetURL extracts the upstream URL from the request path.

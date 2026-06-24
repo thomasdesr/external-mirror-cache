@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 const (
 	ociImageIndexMediaType    = "application/vnd.oci.image.index.v1+json"
+	ociImageManifestMediaType = "application/vnd.oci.image.manifest.v1+json"
 	dockerManifestV2MediaType = "application/vnd.docker.distribution.manifest.v2+json"
 	testManifestETag          = `"manifest-etag"`
 )
@@ -1595,6 +1597,66 @@ func TestIntegration_AcceptForwarding(t *testing.T) {
 				t.Errorf("expected upstream Accept %q, got %q", tt.expectedAccept, receivedAccept)
 			}
 		})
+	}
+}
+
+func TestOCIAwareKeyFunc_OCI_MultipleAcceptHeaders(t *testing.T) {
+	// Clients (e.g. Bazel via Java's HttpURLConnection) send multiple Accept
+	// headers. The variant must reflect the complete set, not just the first.
+	u, _ := url.Parse("https://nvcr.io/v2/nvidia/k8s/dcgm-exporter/manifests/latest")
+	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+	req.Header.Add("Accept", "text/html, image/gif, image/jpeg, */*")
+	req.Header.Add("Accept", ociImageManifestMediaType)
+
+	key := ociAwareKeyFunc(u, req)
+
+	if !strings.Contains(key.Variant, ociImageManifestMediaType) {
+		t.Errorf("expected variant to contain %q, got %q", ociImageManifestMediaType, key.Variant)
+	}
+}
+
+func TestIntegration_AcceptForwarding_MultipleHeaders(t *testing.T) {
+	// Java's HttpURLConnection injects a default Accept first and Bazel appends
+	// the real media-type Accept second. The proxy must forward the complete set
+	// upstream, not drop the second value (which strict registries 404 on).
+	var receivedAccept string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedAccept = strings.Join(r.Header.Values("Accept"), ", ")
+		w.Header().Set("ETag", `"test-etag"`)
+		w.Write([]byte("content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/v2/library/test/manifests/latest")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
+	req.Header.Add("Accept", "text/html, image/gif, image/jpeg, */*")
+	req.Header.Add("Accept", ociImageManifestMediaType)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp.StatusCode)
+	}
+
+	if !strings.Contains(receivedAccept, ociImageManifestMediaType) {
+		t.Errorf("expected upstream Accept to contain %q, got %q", ociImageManifestMediaType, receivedAccept)
 	}
 }
 
