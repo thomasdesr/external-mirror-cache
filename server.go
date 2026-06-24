@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strings"
@@ -104,12 +105,16 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 		fetchType = "conditional"
 	}
 
-	logger = logger.With("target", key.URL.String(), "fetch", fetchType)
-
 	req, err := buildUpstreamRequest(ctx, key.URL, accept, cachedHeaders)
 	if err != nil {
 		return "", err
 	}
+
+	logger = logger.With(
+		slog.String("target", key.URL.String()),
+		slog.String("fetch", fetchType),
+		reqlog.HeaderAttrs("upstream_request_headers", req.Header),
+	)
 
 	logger.Debug("fetching upstream")
 
@@ -125,6 +130,8 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	}
 
 	defer resp.Body.Close() //nolint:errcheck // best-effort close
+
+	logger = logger.With(reqlog.HeaderAttrs("upstream_response_headers", resp.Header))
 
 	// 304 Not Modified - content already cached
 	if resp.StatusCode == http.StatusNotModified {

@@ -19,9 +19,10 @@ func Middleware(next http.Handler) http.Handler {
 		w.Header().Set("X-Request-ID", id)
 
 		logger.InfoContext(ctx, "request started",
-			"method", r.Method,
-			"path", r.URL.Path,
-			"remote_addr", r.RemoteAddr,
+			slog.String("method", r.Method),
+			slog.String("path", r.URL.Path),
+			slog.String("remote_addr", r.RemoteAddr),
+			HeaderAttrs("request_headers", r.Header),
 		)
 
 		sw := &statusWriter{ResponseWriter: w}

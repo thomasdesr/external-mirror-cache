@@ -2832,3 +2832,113 @@ func assertLogMsgHasAttr(t *testing.T, records []map[string]any, msg, attr strin
 
 	t.Logf("note: log message %q not found in output", msg)
 }
+
+// TestIntegration_HeaderLoggingAllowlist verifies that allowlisted headers are
+// logged for the inbound request, the upstream request, and the upstream
+// response, while sensitive headers (Authorization, Set-Cookie) are dropped.
+func TestIntegration_HeaderLoggingAllowlist(t *testing.T) {
+	var buf bytes.Buffer
+
+	oldDefault := slog.Default()
+
+	defer func() {
+		slog.SetDefault(oldDefault)
+	}()
+
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Set-Cookie", "session=upstreamsecret")
+		w.Write([]byte("test content"))
+	}))
+	defer upstream.Close()
+
+	cacheHandler := &cacheMiddleware{
+		cache:    newFakeCache(),
+		client:   upstream.Client(),
+		fallback: FallbackPolicy{},
+	}
+
+	proxy := httptest.NewServer(reqlog.Middleware(cacheHandler))
+	defer proxy.Close()
+
+	req, err := http.NewRequest(http.MethodGet, proxy.URL+upstreamHostPath(upstream, "/test.txt"), nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+
+	req.Header.Set("Accept", "text/plain")
+	req.Header.Set("Authorization", "Bearer clientsecret")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	records := parseJSONLogLines(buf.Bytes())
+
+	// Each group is logged on a different lifecycle event; collect them by name.
+	cases := []struct {
+		group       string
+		wantPresent map[string]string
+		wantAbsent  []string
+	}{
+		{
+			group:       "request_headers",
+			wantPresent: map[string]string{"Accept": "text/plain"},
+			wantAbsent:  []string{"Authorization"},
+		},
+		{
+			group:       "upstream_request_headers",
+			wantPresent: map[string]string{"Accept": "text/plain"},
+			wantAbsent:  []string{"Authorization"},
+		},
+		{
+			group:       "upstream_response_headers",
+			wantPresent: map[string]string{"Content-Type": "text/plain"},
+			wantAbsent:  []string{"Set-Cookie"},
+		},
+	}
+
+	for _, tc := range cases {
+		group := findLogGroup(records, tc.group)
+		if group == nil {
+			t.Errorf("expected a log record containing group %q", tc.group)
+
+			continue
+		}
+
+		for name, want := range tc.wantPresent {
+			if got := group[name]; got != want {
+				t.Errorf("%s[%q] = %v, want %q", tc.group, name, got, want)
+			}
+		}
+
+		for _, name := range tc.wantAbsent {
+			if _, present := group[name]; present {
+				t.Errorf("%s must not contain sensitive header %q, got %v", tc.group, name, group[name])
+			}
+		}
+	}
+}
+
+// findLogGroup returns the first occurrence of the named slog group across all
+// log records, or nil if no record carries it.
+func findLogGroup(records []map[string]any, group string) map[string]any {
+	for _, r := range records {
+		if g, ok := r[group].(map[string]any); ok {
+			return g
+		}
+	}
+
+	return nil
+}
