@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -2447,6 +2448,83 @@ func (b *recordingBody) Close() error {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestFetchAndCache_304 pins the trust boundary on 304: it confirms the cached
+// content only when we sent validators to be confirmed against. Without a
+// cached entry we send none, so a 304 must surface as an upstream error rather
+// than redirect the client at an S3 object that may not exist.
+func TestFetchAndCache_304(t *testing.T) {
+	tests := []notModifiedCase{
+		{name: "spurious 304 without cached entry errors", cached: false, wantErr: true},
+		{name: "304 on conditional fetch presigns", cached: true, wantErr: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+type notModifiedCase struct {
+	name    string
+	cached  bool
+	wantErr bool
+}
+
+func (tc notModifiedCase) run(t *testing.T) {
+	ctx := context.Background()
+	target := &url.URL{Scheme: "https", Host: "example.com", Path: "/pkg-1.0.tar.gz"}
+	key := CacheKey{URL: target}
+
+	cache := newFakeCache()
+
+	if tc.cached {
+		cachedHeaders := http.Header{}
+		cachedHeaders.Set("ETag", `"cached-etag"`)
+
+		if err := cache.Put(ctx, key, cachedHeaders, strings.NewReader("previously cached bytes")); err != nil {
+			t.Fatalf("seed cache: %v", err)
+		}
+	}
+
+	m := &cacheMiddleware{
+		cache: cache,
+		client: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusNotModified,
+				Header:     http.Header{},
+				Body:       http.NoBody,
+				Request:    r,
+			}, nil
+		})},
+	}
+
+	presignedURL, err := m.fetchAndCache(ctx, key, "")
+
+	if !tc.wantErr {
+		if err != nil {
+			t.Fatalf("fetchAndCache: %v", err)
+		}
+
+		if want := "http://fake-s3/" + target.Host + target.Path; presignedURL != want {
+			t.Errorf("presigned URL = %q, want %q", presignedURL, want)
+		}
+
+		return
+	}
+
+	if presignedURL != "" {
+		t.Errorf("presigned URL = %q, want none", presignedURL)
+	}
+
+	var upstreamErr *upstreamError
+	if !errors.As(err, &upstreamErr) {
+		t.Fatalf("fetchAndCache error = %v, want *upstreamError", err)
+	}
+
+	if upstreamErr.StatusCode != http.StatusNotModified {
+		t.Errorf("upstreamError.StatusCode = %d, want %d", upstreamErr.StatusCode, http.StatusNotModified)
+	}
+}
 
 func TestETagStrongMatch(t *testing.T) {
 	tests := []struct {
