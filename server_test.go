@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"pgregory.net/rapid"
+
 	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 )
 
@@ -27,8 +29,9 @@ const (
 
 // fakeCache is an in-memory httpCache for testing.
 type fakeCache struct {
-	mu      sync.RWMutex
-	entries map[string]*cacheEntry
+	mu       sync.RWMutex
+	entries  map[string]*cacheEntry
+	putCalls atomic.Int32
 }
 
 type cacheEntry struct {
@@ -57,6 +60,8 @@ func (c *fakeCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, 
 }
 
 func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, body io.Reader) error {
+	c.putCalls.Add(1)
+
 	data, err := io.ReadAll(body)
 	if err != nil {
 		return err
@@ -2305,6 +2310,204 @@ func TestIntegration_NonOCI_AcceptIgnoredInCacheKey(t *testing.T) {
 	if upstreamHits.Load() != 2 {
 		t.Fatalf("expected 2 upstream hits (same cache entry), got %d", upstreamHits.Load())
 	}
+}
+
+// TestFetchAndCache_Revalidation200 drives the revalidation-200 skip path:
+// only an identical strong ETag avoids the re-upload, and the response body
+// must be abandoned unread (see upstreamUnchanged for the upstream rationale).
+func TestFetchAndCache_Revalidation200(t *testing.T) {
+	const pypiETag = `"fd85a36659d8319dad66a71f3445979c"`
+
+	tests := []revalidation200Case{
+		{name: "identical strong etag skips upload", cached: true, cachedETag: pypiETag, respETag: pypiETag, wantPut: false},
+		{name: "different strong etag uploads", cached: true, cachedETag: `"etag-v1"`, respETag: `"etag-v2"`, wantPut: true},
+		{name: "weak response etag uploads", cached: true, cachedETag: `"x"`, respETag: `W/"x"`, wantPut: true},
+		{name: "weak cached etag uploads", cached: true, cachedETag: `W/"x"`, respETag: `"x"`, wantPut: true},
+		// Weak tags only promise semantic equivalence, never byte-identity.
+		{name: "identical weak etag uploads", cached: true, cachedETag: `W/"x"`, respETag: `W/"x"`, wantPut: true},
+		{name: "missing response etag uploads", cached: true, cachedETag: `"x"`, respETag: "", wantPut: true},
+		{name: "missing cached etag uploads", cached: true, cachedETag: "", respETag: `"x"`, wantPut: true},
+		{name: "first fetch uploads", cached: false, respETag: pypiETag, wantPut: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, tc.run)
+	}
+}
+
+type revalidation200Case struct {
+	name       string
+	cached     bool
+	cachedETag string
+	respETag   string
+	wantPut    bool
+}
+
+func (tc revalidation200Case) run(t *testing.T) {
+	const (
+		upstreamBody = "wheel bytes from upstream"
+		seededBody   = "previously cached bytes"
+	)
+
+	ctx := context.Background()
+	target := &url.URL{
+		Scheme: "https",
+		Host:   "files.pythonhosted.org",
+		Path:   "/packages/ab/cd/pkg-1.0-py3-none-any.whl",
+	}
+	key := CacheKey{URL: target}
+
+	cache := newFakeCache()
+
+	if tc.cached {
+		cachedHeaders := http.Header{}
+		if tc.cachedETag != "" {
+			cachedHeaders.Set("ETag", tc.cachedETag)
+		}
+
+		if err := cache.Put(ctx, key, cachedHeaders, strings.NewReader(seededBody)); err != nil {
+			t.Fatalf("seed cache: %v", err)
+		}
+
+		cache.putCalls.Store(0)
+	}
+
+	body := &recordingBody{reader: strings.NewReader(upstreamBody)}
+
+	m := &cacheMiddleware{
+		cache: cache,
+		client: &http.Client{Transport: roundTripperFunc(func(r *http.Request) (*http.Response, error) {
+			respHeaders := http.Header{}
+			if tc.respETag != "" {
+				respHeaders.Set("ETag", tc.respETag)
+			}
+
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     respHeaders,
+				Body:       body,
+				Request:    r,
+			}, nil
+		})},
+	}
+
+	presignedURL, err := m.fetchAndCache(ctx, key, "")
+	if err != nil {
+		t.Fatalf("fetchAndCache: %v", err)
+	}
+
+	if want := "http://fake-s3/" + target.Host + target.Path; presignedURL != want {
+		t.Errorf("presigned URL = %q, want %q", presignedURL, want)
+	}
+
+	if gotPut := cache.putCalls.Load() > 0; gotPut != tc.wantPut {
+		t.Errorf("cache.Put called = %v, want %v", gotPut, tc.wantPut)
+	}
+
+	wantBody := upstreamBody
+	if !tc.wantPut {
+		wantBody = seededBody
+	}
+
+	if entry := cache.get(key.String()); entry == nil {
+		t.Error("no cache entry after fetch")
+	} else if string(entry.body) != wantBody {
+		t.Errorf("cached body = %q, want %q", entry.body, wantBody)
+	}
+
+	if !tc.wantPut && body.read.Load() {
+		t.Error("response body was read; the transfer must be abandoned, not drained")
+	}
+
+	if !body.closed.Load() {
+		t.Error("response body was not closed")
+	}
+}
+
+// recordingBody is a response body that reports whether anything read it and
+// whether it was closed.
+type recordingBody struct {
+	reader io.Reader
+	read   atomic.Bool
+	closed atomic.Bool
+}
+
+func (b *recordingBody) Read(p []byte) (int, error) {
+	b.read.Store(true)
+
+	return b.reader.Read(p)
+}
+
+func (b *recordingBody) Close() error {
+	b.closed.Store(true)
+
+	return nil
+}
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestETagStrongMatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		cached string
+		resp   string
+		want   bool
+	}{
+		{
+			// Observed on files.pythonhosted.org: a revalidation answered 200
+			// with the ETag we sent.
+			name:   "production quoted md5 round trip",
+			cached: `"fd85a36659d8319dad66a71f3445979c"`,
+			resp:   `"fd85a36659d8319dad66a71f3445979c"`,
+			want:   true,
+		},
+		{name: "equal strong", cached: `"x"`, resp: `"x"`, want: true},
+		{name: "different strong", cached: `"x"`, resp: `"y"`, want: false},
+		{name: "weak response side", cached: `"x"`, resp: `W/"x"`, want: false},
+		{name: "weak cached side", cached: `W/"x"`, resp: `"x"`, want: false},
+		{name: "both weak and equal", cached: `W/"x"`, resp: `W/"x"`, want: false},
+		{name: "both empty", cached: "", resp: "", want: false},
+		{name: "cached empty", cached: "", resp: `"x"`, want: false},
+		{name: "response empty", cached: `"x"`, resp: "", want: false},
+		{name: "opaque tag case differs", cached: `"X"`, resp: `"x"`, want: false},
+		// A strong entity-tag is DQUOTE-delimited (RFC 9110 §8.8.3), so a
+		// lowercase w/"x" is malformed, not an opaque tag -- it must not be
+		// promoted to a strong match.
+		{name: "identical malformed lowercase weak", cached: `w/"x"`, resp: `w/"x"`, want: false},
+		{name: "identical unquoted value", cached: `x`, resp: `x`, want: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := etagStrongMatch(tc.cached, tc.resp); got != tc.want {
+				t.Errorf("etagStrongMatch(%q, %q) = %v, want %v", tc.cached, tc.resp, got, tc.want)
+			}
+		})
+	}
+}
+
+// A tag strong-matches itself exactly when it is a strong tag, never matches
+// a different tag, and the relation does not depend on argument order.
+func TestETagStrongMatch_Properties(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		a := genETag().Draw(t, "a")
+		b := genETag().Draw(t, "b")
+
+		isStrong := !strings.HasPrefix(a, `W/`)
+		if etagStrongMatch(a, a) != isStrong {
+			t.Fatalf("etagStrongMatch(%q, %q) = %v, want %v", a, a, !isStrong, isStrong)
+		}
+
+		if etagStrongMatch(a, b) && a != b {
+			t.Fatalf("etagStrongMatch(%q, %q) matched non-identical tags", a, b)
+		}
+
+		if etagStrongMatch(a, b) != etagStrongMatch(b, a) {
+			t.Fatalf("etagStrongMatch is asymmetric for %q, %q", a, b)
+		}
+	})
 }
 
 // TestIntegration_CacheRefreshOnUpstreamChange verifies the full cache lifecycle:

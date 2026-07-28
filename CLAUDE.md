@@ -59,8 +59,8 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 3. `keyFunc` builds a `CacheKey` from the target URL and request (OCI paths include Accept header as variant; non-OCI paths use URL only)
 4. Server checks S3 for cached response headers (ETag, Last-Modified) using the `CacheKey`
 5. If cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since` (and Accept header if present)
-6. On 304 Not Modified: redirects client to S3 presigned URL
-7. On 200 OK: streams response to S3 cache, then redirects client
+6. On 304 Not Modified -- or a 200 whose strong ETag matches the cached one (some upstreams ignore conditional headers) -- redirects client to S3 presigned URL without re-uploading
+7. On any other 200 OK: streams response to S3 cache, then redirects client
 
 Upstream redirects are followed before caching -- the cache key is the original requested URL (plus variant if applicable), not the final redirect destination.
 
