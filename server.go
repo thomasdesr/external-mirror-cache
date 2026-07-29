@@ -177,15 +177,18 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 }
 
 // upstreamUnchanged reports whether resp indicates the cached content is
-// still current, and the action_reason to log for it. A 200 whose ETag is a
-// strong match for the cached one counts: some upstreams answer a revalidation
-// with a full 200 carrying the very ETag we sent rather than a 304 --
-// files.pythonhosted.org's Fastly VCL strips the conditional headers
-// server-side -- and a strong match means the body is byte-identical to what
-// is already cached, so re-uploading it would only burn S3 PutObject quota.
+// still current, and the action_reason to log for it. Both cases require a
+// cached entry: with nothing cached the request carried no validators, so a
+// 304 confirms nothing and the content it claims is current may not exist in
+// S3 at all. A 200 whose ETag is a strong match for the cached one counts:
+// some upstreams answer a revalidation with a full 200 carrying the very ETag
+// we sent rather than a 304 -- files.pythonhosted.org's Fastly VCL strips the
+// conditional headers server-side -- and a strong match means the body is
+// byte-identical to what is already cached, so re-uploading it would only burn
+// S3 PutObject quota.
 func upstreamUnchanged(resp *http.Response, cachedHeaders http.Header) (string, bool) {
 	switch {
-	case resp.StatusCode == http.StatusNotModified:
+	case resp.StatusCode == http.StatusNotModified && cachedHeaders != nil:
 		return "not modified", true
 	case resp.StatusCode == http.StatusOK && etagStrongMatch(cachedHeaders.Get("ETag"), resp.Header.Get("ETag")):
 		return "etag match on 200", true
