@@ -87,7 +87,8 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // fetchAndCache fetches from upstream and caches to S3, returning the presigned URL.
-// If content is already cached and upstream returns 304, skips re-upload.
+// Skips re-upload when upstream confirms the cached content is current: a 304,
+// or a 200 whose strong ETag matches the cached one.
 func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accept string) (string, error) {
 	logger := reqlog.FromContext(ctx)
 	// Check cache for conditional request headers
@@ -133,9 +134,11 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 
 	logger = logger.With(reqlog.HeaderAttrs("upstream_response_headers", resp.Header))
 
-	// 304 Not Modified - content already cached
-	if resp.StatusCode == http.StatusNotModified {
-		logger.Info("upstream response", "status", resp.StatusCode, "action", "revalidated")
+	// Content already cached: a true 304, or a 200 whose strong ETag matches
+	// the cached one. Return without touching resp.Body so the deferred Close
+	// abandons any 200 body instead of downloading it to discard.
+	if reason, ok := upstreamUnchanged(resp, cachedHeaders); ok {
+		logger.Info("upstream response", "status", resp.StatusCode, "action", "revalidated", "action_reason", reason)
 
 		return m.presign(ctx, key)
 	}
@@ -171,6 +174,39 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	}
 
 	return m.presign(ctx, key)
+}
+
+// upstreamUnchanged reports whether resp indicates the cached content is
+// still current, and the action_reason to log for it. A 200 whose ETag is a
+// strong match for the cached one counts: some upstreams answer a revalidation
+// with a full 200 carrying the very ETag we sent rather than a 304 --
+// files.pythonhosted.org's Fastly VCL strips the conditional headers
+// server-side -- and a strong match means the body is byte-identical to what
+// is already cached, so re-uploading it would only burn S3 PutObject quota.
+func upstreamUnchanged(resp *http.Response, cachedHeaders http.Header) (string, bool) {
+	switch {
+	case resp.StatusCode == http.StatusNotModified:
+		return "not modified", true
+	case resp.StatusCode == http.StatusOK && etagStrongMatch(cachedHeaders.Get("ETag"), resp.Header.Get("ETag")):
+		return "etag match on 200", true
+	}
+
+	return "", false
+}
+
+// etagStrongMatch reports whether two entity tags are equivalent under the
+// RFC 9110 §8.8.3.2 strong comparison: both are strong tags and they are
+// octet-identical.
+func etagStrongMatch(cached, resp string) bool {
+	if cached != resp {
+		return false
+	}
+
+	// A strong entity-tag is DQUOTE-delimited with no weak "W/" prefix
+	// (RFC 9110 §8.8.3). Weak or malformed tags -- W/"x", the invalid
+	// lowercase w/"x", an unquoted value -- never promise byte identity,
+	// so they never strong-match even when octet-identical.
+	return len(cached) >= 2 && strings.HasPrefix(cached, `"`) && strings.HasSuffix(cached, `"`)
 }
 
 func buildUpstreamRequest(ctx context.Context, target *url.URL, accept string, cachedHeaders http.Header) (*http.Request, error) {
