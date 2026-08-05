@@ -1,3 +1,14 @@
 .direnv/
 .nix/
+
+# Build artifacts
 external-mirror-cache
+external-mirror-cache_linux_*/
+mirror-cache
+mirror-cache-arm64
+smokescreen-arm64
+
+# Terraform local state
+.terraform/
+*.tfstate
+*.tfstate.backup
