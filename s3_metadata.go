@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"net/http"
+	"net/textproto"
 	"strings"
 
 	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
@@ -14,6 +15,10 @@ func headerToMetadata(headers http.Header) (map[string]string, error) {
 	metadata := make(map[string]string)
 
 	for k := range headers {
+		if _, ok := metadataHeaderAllowlist[textproto.CanonicalMIMEHeaderKey(k)]; !ok {
+			continue
+		}
+
 		metadataValue, err := json.Marshal(headers.Values(k))
 		if err != nil {
 			return nil, errorutil.Wrapf(err, "marshal metadata %s=%s", k, headers.Values(k))
@@ -23,6 +28,27 @@ func headerToMetadata(headers http.Header) (map[string]string, error) {
 	}
 
 	return metadata, nil
+}
+
+// metadataHeaderAllowlist is the set of response headers (canonical form)
+// worth persisting to S3 object metadata: the validators and freshness fields
+// the mirror reads back, the entity headers describing the stored bytes, and
+// Docker-Content-Digest for OCI upload-skip comparison. Everything else is
+// dropped -- S3 caps user metadata at 2048 bytes, and full upstream header
+// sets exceed it (PyPI's Warehouse endpoints carry a 1155-byte CSP), turning
+// PutObject into a permanent 400 MetadataTooLarge.
+var metadataHeaderAllowlist = map[string]struct{}{
+	"Age":                   {},
+	"Cache-Control":         {},
+	"Content-Encoding":      {},
+	"Content-Length":        {},
+	"Content-Type":          {},
+	"Date":                  {},
+	"Docker-Content-Digest": {},
+	"Etag":                  {},
+	"Expires":               {},
+	"Last-Modified":         {},
+	"Vary":                  {},
 }
 
 // metadataToHeader converts an S3 object's metadata into an http.Header. This

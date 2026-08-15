@@ -1,47 +1,163 @@
 package main
 
 import (
+	"maps"
 	"net/http"
+	"net/textproto"
+	"slices"
+	"strings"
 	"testing"
 
 	"pgregory.net/rapid"
 )
 
-// genHeaderKey generates valid HTTP header keys.
-// HTTP header keys must be valid tokens (alphanumeric + some symbols, no spaces).
-func genHeaderKey() *rapid.Generator[string] {
-	return rapid.StringMatching(`[A-Za-z][A-Za-z0-9-]*`)
+// TestHeaderToMetadata_PyPIWarehouseFitsS3Limit pins the MetadataTooLarge fix:
+// PyPI's Warehouse endpoints (/pypi/*/json, /help/, /rss/) carry ~2.7KB of
+// response headers -- dominated by a 1155-byte Content-Security-Policy and a
+// 610-byte Permissions-Policy (sizes from the 2026-08-15 production
+// investigation) -- which exceeds S3's 2048-byte user-metadata cap and made
+// every PutObject fail with a 400, permanently uncaching those endpoints.
+func TestHeaderToMetadata_PyPIWarehouseFitsS3Limit(t *testing.T) {
+	headers := pypiWarehouseHeaders()
+
+	// Precondition: the fixture reproduces the failing regime. Serializing
+	// every header must exceed the S3 cap, or this test isn't testing the fix.
+	rawSize := 0
+	for k := range headers {
+		rawSize += len(k) + len(strings.Join(headers.Values(k), ","))
+	}
+
+	if rawSize <= 2048 {
+		t.Fatalf("fixture too small to reproduce MetadataTooLarge: %d bytes of raw headers, need > 2048", rawSize)
+	}
+
+	metadata, err := headerToMetadata(headers)
+	if err != nil {
+		t.Fatalf("headerToMetadata failed: %v", err)
+	}
+
+	if size := metadataSize(metadata); size >= 2048 {
+		t.Fatalf("metadata is %d bytes, must stay under S3's 2048-byte cap; metadata: %v", size, metadata)
+	}
+
+	if _, ok := metadata["Content-Security-Policy"]; ok {
+		t.Error("Content-Security-Policy must not be stored: it is never read back")
+	}
+
+	// Revalidation must keep working: validators survive the filter.
+	if _, ok := metadata["Etag"]; !ok {
+		t.Error("ETag must survive filtering or every request re-uploads")
+	}
+
+	if _, ok := metadata["Last-Modified"]; !ok {
+		t.Error("Last-Modified must survive filtering or every request re-uploads")
+	}
 }
 
-// genHeaderValue generates valid HTTP header values.
-// Values can contain most printable characters except certain control chars.
-func genHeaderValue() *rapid.Generator[string] {
-	return rapid.StringMatching(`[ -~]*`)
+// metadataSize is the byte count S3 applies its 2KB user-metadata cap to:
+// the sum of key and value lengths.
+func metadataSize(metadata map[string]string) int {
+	size := 0
+	for k, v := range metadata {
+		size += len(k) + len(v)
+	}
+
+	return size
 }
 
-// genHeader generates a random http.Header with 0-10 keys, each with 1-5 values.
-func genHeader() *rapid.Generator[http.Header] {
-	return rapid.Custom(func(t *rapid.T) http.Header {
-		h := make(http.Header)
-		numKeys := rapid.IntRange(0, 10).Draw(t, "numKeys")
+// pypiWarehouseHeaders reconstructs the header set of a pypi.org/pypi/*/json
+// response as captured in the 2026-08-15 production investigation: 26 headers,
+// ~2.7KB serialized, with CSP and Permissions-Policy padded to their captured
+// sizes (1155 and 610 bytes).
+func pypiWarehouseHeaders() http.Header {
+	h := make(http.Header)
 
-		for range numKeys {
-			key := genHeaderKey().Draw(t, "key")
-			numValues := rapid.IntRange(1, 5).Draw(t, "numValues")
+	csp := "default-src 'none'; base-uri 'self'; block-all-mixed-content; " +
+		"connect-src 'self' https://api.github.com/repos/ https://api.github.com/search/issues " +
+		"https://gitlab.com/api/ https://analytics.python.org fastly-insights.com " +
+		"*.fastly-insights.com *.ethicalads.io https://api.pwnedpasswords.com " +
+		"https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/sre/mathmaps/ " +
+		"https://2p66nmmycsj3.statuspage.io; font-src 'self' fonts.gstatic.com; " +
+		"form-action 'self' https://checkout.stripe.com; frame-ancestors 'none'; " +
+		"frame-src 'none'; img-src 'self' https://warehouse-camo.ingress.cmh1.psfhosted.org/ " +
+		"*.fastly-insights.com *.ethicalads.io ethicalads.blob.core.windows.net; " +
+		"script-src 'self' https://analytics.python.org *.fastly-insights.com *.ethicalads.io"
+	h.Set("Content-Security-Policy", padTo(csp, 1155))
 
-			for range numValues {
-				value := genHeaderValue().Draw(t, "value")
-				h.Add(key, value)
+	pp := "accelerometer=(), ambient-light-sensor=(), autoplay=(), battery=(), camera=(), " +
+		"cross-origin-isolated=(), display-capture=(), document-domain=(), encrypted-media=(), " +
+		"execution-while-not-rendered=(), execution-while-out-of-viewport=(), fullscreen=(), " +
+		"geolocation=(), gyroscope=(), keyboard-map=(), magnetometer=(), microphone=(), midi=()"
+	h.Set("Permissions-Policy", padTo(pp, 610))
+
+	h.Set("Content-Type", "application/json")
+	h.Set("Content-Length", "45231")
+	h.Set("ETag", `"kXjB2Z8yQ4vN0mP1sT6wRg"`)
+	h.Set("Last-Modified", "Fri, 08 Aug 2026 11:22:33 GMT")
+	h.Set("Cache-Control", "max-age=900, public")
+	h.Set("Vary", "Accept-Encoding")
+	h.Set("Date", "Fri, 15 Aug 2026 02:06:23 GMT")
+	h.Set("Age", "0")
+	h.Set("Server", "nginx/1.25.2")
+	h.Set("Accept-Ranges", "bytes")
+	h.Set("Access-Control-Allow-Headers", "Content-Type, If-Match, If-Modified-Since, If-None-Match, If-Unmodified-Since")
+	h.Set("Access-Control-Allow-Methods", "GET")
+	h.Set("Access-Control-Allow-Origin", "*")
+	h.Set("Access-Control-Expose-Headers", "X-PyPI-Last-Serial")
+	h.Set("Access-Control-Max-Age", "86400")
+	h.Set("Referrer-Policy", "origin-when-cross-origin")
+	h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("X-Frame-Options", "deny")
+	h.Set("X-XSS-Protection", "1; mode=block")
+	h.Set("X-Pypi-Last-Serial", "31251983")
+	h.Set("X-Served-By", "cache-iad-kiad7000021-IAD, cache-pao-kpao1770020-PAO")
+	h.Set("X-Cache", "MISS, MISS")
+	h.Set("X-Cache-Hits", "0, 0")
+	h.Set("X-Timer", "S1755223583.123456,VS0,VE145")
+
+	return h
+}
+
+// padTo extends s to exactly n bytes with a repeated filler so fixture header
+// sizes match the production capture without transcribing full values.
+func padTo(s string, n int) string {
+	for len(s) < n {
+		s += " https://padding.invalid"
+	}
+
+	return s[:n]
+}
+
+func TestHeaderToMetadata_KeepsOnlyAllowlistedHeaders(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		original := genMixedHeader().Draw(t, "header")
+
+		metadata, err := headerToMetadata(original)
+		if err != nil {
+			t.Fatalf("headerToMetadata failed: %v", err)
+		}
+
+		for k := range metadata {
+			if _, ok := metadataHeaderAllowlist[textproto.CanonicalMIMEHeaderKey(k)]; !ok {
+				t.Fatalf("non-allowlisted header %q leaked into metadata", k)
 			}
 		}
 
-		return h
+		// Every allowlisted header present in the input survives.
+		for k := range original {
+			if _, ok := metadataHeaderAllowlist[textproto.CanonicalMIMEHeaderKey(k)]; ok {
+				if _, present := metadata[textproto.CanonicalMIMEHeaderKey(k)]; !present {
+					t.Fatalf("allowlisted header %q was dropped", k)
+				}
+			}
+		}
 	})
 }
 
 func TestHeaderRoundTrip(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		original := genHeader().Draw(t, "header")
+		original := genAllowlistedHeader().Draw(t, "header")
 
 		metadata, err := headerToMetadata(original)
 		if err != nil {
@@ -61,7 +177,7 @@ func TestHeaderRoundTrip(t *testing.T) {
 
 func TestHeaderRoundTripWithAmzPrefix(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		original := genHeader().Draw(t, "header")
+		original := genAllowlistedHeader().Draw(t, "header")
 
 		metadata, err := headerToMetadata(original)
 		if err != nil {
@@ -85,9 +201,41 @@ func TestHeaderRoundTripWithAmzPrefix(t *testing.T) {
 	})
 }
 
+// TestMetadataToHeaderReadsAnyKey pins the read path staying permissive: the
+// existing S3 corpus was written before the allowlist and carries arbitrary
+// headers, which must keep parsing so cached validators keep working.
+func TestMetadataToHeaderReadsAnyKey(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		original := genMixedHeader().Draw(t, "header")
+
+		metadata := make(map[string]string)
+		for k := range original {
+			metadata[k] = mustMarshalValues(t, original.Values(k))
+		}
+
+		recovered, err := metadataToHeader(metadata)
+		if err != nil {
+			t.Fatalf("metadataToHeader failed: %v", err)
+		}
+
+		if !headersEqual(original, recovered) {
+			t.Fatalf("read path dropped or altered headers:\noriginal:  %v\nrecovered: %v", original, recovered)
+		}
+	})
+}
+
+func mustMarshalValues(t *rapid.T, values []string) string {
+	metadata, err := headerToMetadata(http.Header{"Etag": values})
+	if err != nil {
+		t.Fatalf("marshal values: %v", err)
+	}
+
+	return metadata["Etag"]
+}
+
 func TestMetadataToHeaderIsPure(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		original := genHeader().Draw(t, "header")
+		original := genAllowlistedHeader().Draw(t, "header")
 
 		metadata, err := headerToMetadata(original)
 		if err != nil {
@@ -130,6 +278,56 @@ func TestEmptyHeaderRoundTrip(t *testing.T) {
 	if len(recovered) != 0 {
 		t.Fatalf("expected empty header, got: %v", recovered)
 	}
+}
+
+// genAllowlistedHeader generates headers whose keys all survive metadata
+// filtering, for round-trip properties.
+func genAllowlistedHeader() *rapid.Generator[http.Header] {
+	return genHeaderFromKeys(rapid.SampledFrom(slices.Sorted(maps.Keys(metadataHeaderAllowlist))))
+}
+
+// genMixedHeader generates headers mixing allowlisted and arbitrary keys.
+func genMixedHeader() *rapid.Generator[http.Header] {
+	allowlisted := slices.Sorted(maps.Keys(metadataHeaderAllowlist))
+	keyGen := rapid.OneOf(
+		rapid.SampledFrom(allowlisted),
+		genHeaderKey(),
+	)
+
+	return genHeaderFromKeys(keyGen)
+}
+
+// genHeaderKey generates valid HTTP header keys.
+// HTTP header keys must be valid tokens (alphanumeric + some symbols, no spaces).
+func genHeaderKey() *rapid.Generator[string] {
+	return rapid.StringMatching(`[A-Za-z][A-Za-z0-9-]*`)
+}
+
+// genHeaderValue generates valid HTTP header values.
+// Values can contain most printable characters except certain control chars.
+func genHeaderValue() *rapid.Generator[string] {
+	return rapid.StringMatching(`[ -~]*`)
+}
+
+// genHeaderFromKeys generates a random http.Header with 0-10 keys drawn from
+// keyGen, each with 1-5 values.
+func genHeaderFromKeys(keyGen *rapid.Generator[string]) *rapid.Generator[http.Header] {
+	return rapid.Custom(func(t *rapid.T) http.Header {
+		h := make(http.Header)
+		numKeys := rapid.IntRange(0, 10).Draw(t, "numKeys")
+
+		for range numKeys {
+			key := keyGen.Draw(t, "key")
+			numValues := rapid.IntRange(1, 5).Draw(t, "numValues")
+
+			for range numValues {
+				value := genHeaderValue().Draw(t, "value")
+				h.Add(key, value)
+			}
+		}
+
+		return h
+	})
 }
 
 // headersEqual compares two http.Header values for equality.
