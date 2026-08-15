@@ -77,7 +77,11 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &ue) {
 			http.Error(w, http.StatusText(ue.StatusCode), ue.StatusCode)
 		} else {
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			// Not http.StatusText(502): a relayed upstream 502 renders as
+			// "Bad Gateway" above, and a mirror-side failure (S3 write,
+			// upstream transport) must be distinguishable from it, or clients
+			// misread internal failures as upstream outages.
+			http.Error(w, "mirror-cache error: upstream fetch or cache write failed", http.StatusBadGateway)
 		}
 
 		return
@@ -164,6 +168,12 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	// 200 OK - stream to cache
 	err = m.cache.Put(ctx, key, resp.Header, bufio.NewReader(resp.Body))
 	if err != nil {
+		if conditionalFetch && m.fallback.ShouldFallback(err, 0) {
+			logger.Warn("cache write failed", "action", "stale", "action_reason", err.Error())
+
+			return m.presign(ctx, key)
+		}
+
 		return "", errorutil.Wrapf(err, "cache %s", key.URL)
 	}
 

@@ -32,6 +32,7 @@ const (
 type fakeCache struct {
 	mu       sync.RWMutex
 	entries  map[string]*cacheEntry
+	putErr   error // when set, Put fails with this error instead of storing
 	putCalls atomic.Int32
 }
 
@@ -71,12 +72,23 @@ func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.putErr != nil {
+		return c.putErr
+	}
+
 	c.entries[key.String()] = &cacheEntry{
 		headers: headers.Clone(),
 		body:    data,
 	}
 
 	return nil
+}
+
+func (c *fakeCache) setPutError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.putErr = err
 }
 
 func (c *fakeCache) get(u string) *cacheEntry {
@@ -886,6 +898,176 @@ func TestIntegration_FallbackOnAnyError_Covers4xx(t *testing.T) {
 
 	if resp2.StatusCode != http.StatusSeeOther {
 		t.Errorf("expected 303 redirect (stale fallback on 404), got %d", resp2.StatusCode)
+	}
+}
+
+var errSimulatedPutFailure = errors.New("simulated S3 write failure")
+
+// newChangingUpstream returns a TLS upstream whose first response carries ETag
+// "v1" and later responses carry ETag "v2" with a different body, so a
+// revalidation never 304s or etag-matches and always reaches cache.Put.
+func newChangingUpstream() *httptest.Server {
+	var requestCount atomic.Int32
+
+	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requestCount.Add(1) == 1 {
+			w.Header().Set("ETag", `"v1"`)
+			w.Write([]byte("original content"))
+
+			return
+		}
+
+		w.Header().Set("ETag", `"v2"`)
+		w.Write([]byte("updated content"))
+	}))
+}
+
+func TestIntegration_CacheWriteFailure_ServesStaleWithFallback(t *testing.T) {
+	upstream := newChangingUpstream()
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{OnAnyError: true})
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/put-fail.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	// First request: warm the cache.
+	resp1, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	resp1.Body.Close()
+
+	if resp1.StatusCode != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", resp1.StatusCode)
+	}
+
+	// Second request: content changed upstream, cache write fails. The stale
+	// copy is valid and the policy allows serving it.
+	cache.setPutError(errSimulatedPutFailure)
+
+	resp2, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusSeeOther {
+		t.Errorf("expected 303 redirect (stale fallback on cache write failure), got %d", resp2.StatusCode)
+	}
+}
+
+func TestIntegration_CacheWriteFailure_FallbackDisabled_Errors(t *testing.T) {
+	upstream := newChangingUpstream()
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{})
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/put-fail-no-fallback.txt")
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	resp1, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	resp1.Body.Close()
+
+	cache.setPutError(errSimulatedPutFailure)
+
+	resp2, err := client.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("second request failed: %v", err)
+	}
+	defer resp2.Body.Close()
+
+	if resp2.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502 when fallback disabled, got %d", resp2.StatusCode)
+	}
+}
+
+// TestIntegration_CacheWriteFailure_NoCachedCopy_ErrorsEvenWithFallback pins
+// that stale fallback on a cache write failure requires a cached copy to fall
+// back TO: presigning without one would redirect clients to an S3 404.
+func TestIntegration_CacheWriteFailure_NoCachedCopy_ErrorsEvenWithFallback(t *testing.T) {
+	upstream := newChangingUpstream()
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	cache.setPutError(errSimulatedPutFailure)
+
+	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{OnAnyError: true})
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/put-fail-cold.txt")
+
+	resp, err := http.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Errorf("expected 502 on cache write failure with nothing cached, got %d", resp.StatusCode)
+	}
+}
+
+// TestIntegration_InternalError_DistinctFromUpstreamBadGateway pins the error
+// surface: an internal failure (here a cache write) must not produce the same
+// body as a relayed upstream 502 ("Bad Gateway" via http.StatusText), which
+// previously made an S3 write failure indistinguishable from an upstream
+// outage.
+func TestIntegration_InternalError_DistinctFromUpstreamBadGateway(t *testing.T) {
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("ETag", `"v1"`)
+		w.Write([]byte("content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	cache.setPutError(errSimulatedPutFailure)
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	proxyPath := upstreamHostPath(upstream, "/internal-error.txt")
+
+	resp, err := http.Get(proxy.URL + proxyPath)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502, got %d", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+
+	if !strings.Contains(string(body), "mirror-cache") {
+		t.Errorf("internal-error body %q must name the mirror, not read as an upstream response", body)
 	}
 }
 
