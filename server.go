@@ -78,10 +78,11 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, http.StatusText(ue.StatusCode), ue.StatusCode)
 		} else {
 			// Not http.StatusText(502): a relayed upstream 502 renders as
-			// "Bad Gateway" above, and a mirror-side failure (S3 write,
-			// upstream transport) must be distinguishable from it, or clients
-			// misread internal failures as upstream outages.
-			http.Error(w, "mirror-cache error: upstream fetch or cache write failed", http.StatusBadGateway)
+			// "Bad Gateway" above, and a mirror-side failure must be
+			// distinguishable from it, or clients misread internal failures
+			// as upstream outages. Stage-neutral wording because this branch
+			// catches fetch transport, cache write, and presign errors alike.
+			http.Error(w, "mirror-cache internal error, see X-Request-ID", http.StatusBadGateway)
 		}
 
 		return
