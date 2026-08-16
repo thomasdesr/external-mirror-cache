@@ -1,9 +1,9 @@
 package main
 
 import (
+	"encoding/json"
 	"maps"
 	"net/http"
-	"net/textproto"
 	"slices"
 	"strings"
 	"testing"
@@ -66,9 +66,10 @@ func metadataSize(metadata map[string]string) int {
 }
 
 // pypiWarehouseHeaders reconstructs the header set of a pypi.org/pypi/*/json
-// response as captured in the 2026-08-15 production investigation: 26 headers,
-// ~2.7KB serialized, with CSP and Permissions-Policy padded to their captured
-// sizes (1155 and 610 bytes).
+// response. Only the shape and two sizes come from the 2026-08-15 production
+// investigation -- 26 headers, ~2.7KB serialized, CSP and Permissions-Policy
+// padded to their measured 1155 and 610 bytes; every value is an invented
+// placeholder, not captured data.
 func pypiWarehouseHeaders() http.Header {
 	h := make(http.Header)
 
@@ -93,10 +94,10 @@ func pypiWarehouseHeaders() http.Header {
 	h.Set("Content-Type", "application/json")
 	h.Set("Content-Length", "45231")
 	h.Set("ETag", `"kXjB2Z8yQ4vN0mP1sT6wRg"`)
-	h.Set("Last-Modified", "Fri, 08 Aug 2026 11:22:33 GMT")
+	h.Set("Last-Modified", "Sat, 08 Aug 2026 11:22:33 GMT")
 	h.Set("Cache-Control", "max-age=900, public")
 	h.Set("Vary", "Accept-Encoding")
-	h.Set("Date", "Fri, 15 Aug 2026 02:06:23 GMT")
+	h.Set("Date", "Sat, 15 Aug 2026 02:06:23 GMT")
 	h.Set("Age", "0")
 	h.Set("Server", "nginx/1.25.2")
 	h.Set("Accept-Ranges", "bytes")
@@ -114,13 +115,14 @@ func pypiWarehouseHeaders() http.Header {
 	h.Set("X-Served-By", "cache-iad-kiad7000021-IAD, cache-pao-kpao1770020-PAO")
 	h.Set("X-Cache", "MISS, MISS")
 	h.Set("X-Cache-Hits", "0, 0")
-	h.Set("X-Timer", "S1755223583.123456,VS0,VE145")
+	h.Set("X-Timer", "S1786759583.123456,VS0,VE145")
 
 	return h
 }
 
 // padTo extends s to exactly n bytes with a repeated filler so fixture header
-// sizes match the production capture without transcribing full values.
+// sizes match the investigation's measured sizes without transcribing full
+// values.
 func padTo(s string, n int) string {
 	for len(s) < n {
 		s += " https://padding.invalid"
@@ -139,20 +141,50 @@ func TestHeaderToMetadata_KeepsOnlyAllowlistedHeaders(t *testing.T) {
 		}
 
 		for k := range metadata {
-			if _, ok := metadataHeaderAllowlist[textproto.CanonicalMIMEHeaderKey(k)]; !ok {
+			if _, ok := metadataHeaderAllowlist[http.CanonicalHeaderKey(k)]; !ok {
 				t.Fatalf("non-allowlisted header %q leaked into metadata", k)
 			}
 		}
 
 		// Every allowlisted header present in the input survives.
 		for k := range original {
-			if _, ok := metadataHeaderAllowlist[textproto.CanonicalMIMEHeaderKey(k)]; ok {
-				if _, present := metadata[textproto.CanonicalMIMEHeaderKey(k)]; !present {
+			if _, ok := metadataHeaderAllowlist[http.CanonicalHeaderKey(k)]; ok {
+				if _, present := metadata[http.CanonicalHeaderKey(k)]; !present {
 					t.Fatalf("allowlisted header %q was dropped", k)
 				}
 			}
 		}
 	})
+}
+
+// TestHeaderToMetadata_RequiredHeadersSurvive pins the allowlist's required
+// members independently of the allowlist variable (the property tests above
+// draw from and assert against the map itself, so they cannot catch an entry
+// being removed). The duplication of the list here is the point.
+func TestHeaderToMetadata_RequiredHeadersSurvive(t *testing.T) {
+	required := []string{
+		// Read back for conditional requests and the etag-skip.
+		"ETag", "Last-Modified",
+		// Read by the RFC 9111 freshness design
+		// (docs/design-plans/2026-08-04-rfc9111-freshness.md).
+		"Cache-Control", "Age", "Date", "Expires", "Vary",
+	}
+
+	h := make(http.Header)
+	for _, k := range required {
+		h.Set(k, "value")
+	}
+
+	metadata, err := headerToMetadata(h)
+	if err != nil {
+		t.Fatalf("headerToMetadata failed: %v", err)
+	}
+
+	for _, k := range required {
+		if _, ok := metadata[http.CanonicalHeaderKey(k)]; !ok {
+			t.Errorf("required header %q must survive metadata filtering", k)
+		}
+	}
 }
 
 func TestHeaderRoundTrip(t *testing.T) {
@@ -201,6 +233,86 @@ func TestHeaderRoundTripWithAmzPrefix(t *testing.T) {
 	})
 }
 
+// TestHeaderRoundTripWithS3LowercaseKeys pins the key shape aws-sdk-go-v2's
+// HeadObject actually returns: metadata keys come back lowercased with the
+// x-amz-meta- prefix already stripped.
+func TestHeaderRoundTripWithS3LowercaseKeys(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		original := genAllowlistedHeader().Draw(t, "header")
+
+		metadata, err := headerToMetadata(original)
+		if err != nil {
+			t.Fatalf("headerToMetadata failed: %v", err)
+		}
+
+		lowercased := make(map[string]string)
+		for k, v := range metadata {
+			lowercased[strings.ToLower(k)] = v
+		}
+
+		recovered, err := metadataToHeader(lowercased)
+		if err != nil {
+			t.Fatalf("metadataToHeader failed: %v", err)
+		}
+
+		if !headersEqual(original, recovered) {
+			t.Fatalf("round-trip with lowercase keys failed:\noriginal:  %v\nrecovered: %v", original, recovered)
+		}
+	})
+}
+
+// TestHeaderRoundTripNonCanonicalKeys pins that a header map whose keys are
+// not in canonical form (possible when a map is built directly rather than
+// via Set/Add) still round-trips: values must come from the map entry itself,
+// not a canonicalizing lookup that misses the non-canonical key.
+func TestHeaderRoundTripNonCanonicalKeys(t *testing.T) {
+	rapid.Check(t, func(t *rapid.T) {
+		keys := rapid.SliceOfNDistinct(
+			rapid.SampledFrom(slices.Sorted(maps.Keys(metadataHeaderAllowlist))),
+			1, 5, rapid.ID,
+		).Draw(t, "keys")
+
+		original := make(http.Header)
+		expected := make(http.Header)
+
+		for _, k := range keys {
+			value := genHeaderValue().Draw(t, "value")
+			original[randomizeCase(t, k)] = []string{value}
+			expected.Add(k, value)
+		}
+
+		metadata, err := headerToMetadata(original)
+		if err != nil {
+			t.Fatalf("headerToMetadata failed: %v", err)
+		}
+
+		recovered, err := metadataToHeader(metadata)
+		if err != nil {
+			t.Fatalf("metadataToHeader failed: %v", err)
+		}
+
+		if !headersEqual(expected, recovered) {
+			t.Fatalf("non-canonical round-trip failed:\noriginal:  %v\nexpected:  %v\nrecovered: %v", original, expected, recovered)
+		}
+	})
+}
+
+func randomizeCase(t *rapid.T, s string) string {
+	out := []byte(s)
+	for i, c := range out {
+		if rapid.Bool().Draw(t, "flip") {
+			switch {
+			case c >= 'a' && c <= 'z':
+				out[i] = c - 'a' + 'A'
+			case c >= 'A' && c <= 'Z':
+				out[i] = c - 'A' + 'a'
+			}
+		}
+	}
+
+	return string(out)
+}
+
 // TestMetadataToHeaderReadsAnyKey pins the read path staying permissive: the
 // existing S3 corpus was written before the allowlist and carries arbitrary
 // headers, which must keep parsing so cached validators keep working.
@@ -225,12 +337,12 @@ func TestMetadataToHeaderReadsAnyKey(t *testing.T) {
 }
 
 func mustMarshalValues(t *rapid.T, values []string) string {
-	metadata, err := headerToMetadata(http.Header{"Etag": values})
+	encoded, err := json.Marshal(values)
 	if err != nil {
 		t.Fatalf("marshal values: %v", err)
 	}
 
-	return metadata["Etag"]
+	return string(encoded)
 }
 
 func TestMetadataToHeaderIsPure(t *testing.T) {

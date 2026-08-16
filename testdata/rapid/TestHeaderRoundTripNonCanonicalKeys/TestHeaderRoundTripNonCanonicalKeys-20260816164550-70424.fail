@@ -1,0 +1,19 @@
+# 2026/08/16 16:45:50.754935 [TestHeaderRoundTripNonCanonicalKeys] [rapid] draw keys: []string{"Age"}
+# 2026/08/16 16:45:50.757555 [TestHeaderRoundTripNonCanonicalKeys] [rapid] draw value: ""
+# 2026/08/16 16:45:50.757567 [TestHeaderRoundTripNonCanonicalKeys] [rapid] draw flip: false
+# 2026/08/16 16:45:50.757571 [TestHeaderRoundTripNonCanonicalKeys] [rapid] draw flip: false
+# 2026/08/16 16:45:50.757571 [TestHeaderRoundTripNonCanonicalKeys] [rapid] draw flip: true
+# 2026/08/16 16:45:50.757617 [TestHeaderRoundTripNonCanonicalKeys] non-canonical round-trip failed:
+# original:  map[AgE:[]]
+# expected:  map[Age:[]]
+# recovered: map[]
+#
+v0.4.8#7462643207879840160
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x1
