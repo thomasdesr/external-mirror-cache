@@ -60,7 +60,7 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 4. Server checks S3 for cached response headers (ETag, Last-Modified) using the `CacheKey`
 5. If cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since` (and Accept header if present)
 6. On 304 Not Modified -- or a 200 whose strong ETag matches the cached one (some upstreams ignore conditional headers) -- redirects client to S3 presigned URL without re-uploading
-7. On any other 200 OK: streams response to S3 cache, then redirects client
+7. On any other 200 OK: streams response to S3 cache, then redirects client. A cache-write failure always errors -- S3 trouble is mirror infrastructure and must surface, never be masked by stale-serving
 
 Upstream redirects are followed before caching -- the cache key is the original requested URL (plus variant if applicable), not the final redirect destination.
 
@@ -68,8 +68,8 @@ Upstream redirects are followed before caching -- the cache key is the original 
 - `server.go` - Main HTTP handler (`cacheMiddleware`): parses `/<domain>/<path>` requests, builds a `CacheKey` via pluggable `keyFunc`, checks S3 cache, fetches upstream with singleflight dedup (keyed on `CacheKey.String()`), forwards Accept header to upstream, redirects clients to presigned S3 URLs. `ociAwareKeyFunc` includes Accept as the variant for `/v2/` OCI paths; non-OCI paths use URL-only keys
 - `cache.go` - `CacheKey` type (URL + Variant) and `httpCache` interface: `Head`, `Put`, `GetPresignedURL` (all take `CacheKey`)
 - `s3_cache.go` - S3 implementation of `httpCache`: stores responses and serves presigned URLs. S3 path is `<prefix>/<host>/<path>` for URL-only keys, with `//<variant>` appended for variant keys
-- `s3_metadata.go` - Serializes HTTP headers to/from S3 object metadata as JSON
-- `fallback.go` - `FallbackPolicy`: controls when stale cached content is served on upstream errors
+- `s3_metadata.go` - Serializes HTTP headers to/from S3 object metadata as JSON. Writes only an allowlisted subset (validators, entity headers, freshness fields) -- S3 caps user metadata at 2KB and full upstream header sets exceed it; reads stay permissive for the pre-allowlist corpus
+- `fallback.go` - `FallbackPolicy`: controls when stale cached content is served on upstream errors. Upstream only by design: cache-write (S3) failures never consult it
 - `http_caching.go` - Injects conditional request headers from cached headers
 - `oci_auth.go` - OCI Bearer token auth transport. Intercepts 401 challenges from OCI registries (e.g., Docker Hub), fetches anonymous tokens, caches them with TTL, and retries. Uses singleflight to deduplicate concurrent token fetches. Proactive path reuses cached challenges to avoid discovery round-trips. Only activates for `/v2/` OCI paths; non-OCI requests and requests with existing Authorization headers pass through. Transport chain: `http.Client` -> `ociAuthTransport` -> `http.Transport`
 

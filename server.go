@@ -77,7 +77,12 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if errors.As(err, &ue) {
 			http.Error(w, http.StatusText(ue.StatusCode), ue.StatusCode)
 		} else {
-			http.Error(w, "Bad Gateway", http.StatusBadGateway)
+			// Not http.StatusText(502): a relayed upstream 502 renders as
+			// "Bad Gateway" above, and a mirror-side failure must be
+			// distinguishable from it, or clients misread internal failures
+			// as upstream outages. Stage-neutral wording because this branch
+			// catches fetch transport, cache write, and presign errors alike.
+			http.Error(w, "mirror-cache internal error, see X-Request-ID", http.StatusBadGateway)
 		}
 
 		return
@@ -164,6 +169,11 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	// 200 OK - stream to cache
 	err = m.cache.Put(ctx, key, resp.Header, bufio.NewReader(resp.Body))
 	if err != nil {
+		// Deliberately no stale fallback: the policy governs upstream
+		// failures, and a cache-write failure is the mirror's own
+		// infrastructure (S3) in trouble. Serving stale here would mask it --
+		// a warm cache would hide a broken write path until content changed,
+		// pinning clients to old bytes with no visible error anywhere.
 		return "", errorutil.Wrapf(err, "cache %s", key.URL)
 	}
 

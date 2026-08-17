@@ -13,16 +13,44 @@ import (
 func headerToMetadata(headers http.Header) (map[string]string, error) {
 	metadata := make(map[string]string)
 
-	for k := range headers {
-		metadataValue, err := json.Marshal(headers.Values(k))
+	for k, values := range headers {
+		if _, ok := metadataHeaderAllowlist[http.CanonicalHeaderKey(k)]; !ok {
+			continue
+		}
+
+		metadataValue, err := json.Marshal(values)
 		if err != nil {
-			return nil, errorutil.Wrapf(err, "marshal metadata %s=%s", k, headers.Values(k))
+			return nil, errorutil.Wrapf(err, "marshal metadata %s=%s", k, values)
 		}
 
 		metadata[k] = string(metadataValue)
 	}
 
 	return metadata, nil
+}
+
+// metadataHeaderAllowlist is the set of response headers (canonical form)
+// worth persisting to S3 object metadata: the validators the mirror reads
+// back for conditional requests (ETag, Last-Modified), the entity headers
+// describing the stored bytes, and fields reserved for designed-but-unlanded
+// consumers -- the RFC 9111 freshness gate reads Cache-Control/Age/Date/
+// Expires/Vary and its follow-up upload-skip rider reads
+// Docker-Content-Digest (docs/design-plans/2026-08-04-rfc9111-freshness.md).
+// Everything else is dropped -- S3 caps user metadata at 2048 bytes, and full
+// upstream header sets exceed it (PyPI's Warehouse endpoints carry a
+// 1155-byte CSP), turning PutObject into a permanent 400 MetadataTooLarge.
+var metadataHeaderAllowlist = map[string]struct{}{
+	"Age":                   {},
+	"Cache-Control":         {},
+	"Content-Encoding":      {},
+	"Content-Length":        {},
+	"Content-Type":          {},
+	"Date":                  {},
+	"Docker-Content-Digest": {},
+	"Etag":                  {},
+	"Expires":               {},
+	"Last-Modified":         {},
+	"Vary":                  {},
 }
 
 // metadataToHeader converts an S3 object's metadata into an http.Header. This
