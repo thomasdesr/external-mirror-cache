@@ -34,7 +34,7 @@ type cacheMiddleware struct {
 	cache       httpCache
 	client      *http.Client
 	fallback    FallbackPolicy
-	keyFunc     func(target *url.URL, r *http.Request) CacheKey
+	keyFunc     func(target *url.URL, r *http.Request) (CacheKey, []string)
 	uploadGroup singleflight.Group[string] // dedupes concurrent requests, returns presigned URL
 }
 
@@ -59,7 +59,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accept := acceptHeader(r)
-	key := m.buildKey(target, r)
+	key, _ := m.buildKey(target, r)
 
 	// Singleflight ensures only one request fetches from upstream.
 	// All callers (including leader) redirect to the cached content.
@@ -96,15 +96,16 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // or a 200 whose strong ETag matches the cached one.
 func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accept string) (string, error) {
 	logger := reqlog.FromContext(ctx)
-	// Check cache for conditional request headers
-	cachedHeaders, err := m.cache.Head(ctx, key)
-	if err != nil {
-		logger.Warn("cache head error", "target", key.URL.String(), "error", err)
 
-		cachedHeaders = nil
+	// Check cache for conditional request headers
+	entry := m.headEntry(ctx, key)
+
+	var cachedHeaders http.Header
+	if entry != nil {
+		cachedHeaders = entry.Headers
 	}
 
-	conditionalFetch := cachedHeaders != nil
+	conditionalFetch := entry != nil
 
 	fetchType := "first"
 	if conditionalFetch {
@@ -239,6 +240,19 @@ func buildUpstreamRequest(ctx context.Context, target *url.URL, accept string, c
 	return req, nil
 }
 
+// headEntry looks up the cache entry for key, degrading lookup errors to a
+// cache miss so an S3 head failure never fails the request.
+func (m *cacheMiddleware) headEntry(ctx context.Context, key CacheKey) *cachedEntry {
+	entry, err := m.cache.Head(ctx, key)
+	if err != nil {
+		reqlog.FromContext(ctx).Warn("cache head error", "target", key.URL.String(), "error", err)
+
+		return nil
+	}
+
+	return entry
+}
+
 func (m *cacheMiddleware) presign(ctx context.Context, key CacheKey) (string, error) {
 	u, err := m.cache.GetPresignedURL(ctx, key)
 	if err != nil {
@@ -248,23 +262,29 @@ func (m *cacheMiddleware) presign(ctx context.Context, key CacheKey) (string, er
 	return u, nil
 }
 
-func (m *cacheMiddleware) buildKey(target *url.URL, r *http.Request) CacheKey {
+// buildKey returns the cache key plus the header names its variant encodes
+// (the freshness gate's Vary guard tolerates only those).
+func (m *cacheMiddleware) buildKey(target *url.URL, r *http.Request) (CacheKey, []string) {
 	if m.keyFunc != nil {
 		return m.keyFunc(target, r)
 	}
 
-	return CacheKey{URL: target}
+	return CacheKey{URL: target}, nil
 }
 
 // ociAwareKeyFunc builds a CacheKey that includes the Accept header as the
-// variant for OCI paths (/v2/...), enabling per-format caching. Non-OCI paths
-// produce an empty variant, preserving URL-only keying.
-func ociAwareKeyFunc(target *url.URL, r *http.Request) CacheKey {
+// variant for OCI paths (/v2/...), enabling per-format caching, and reports
+// Accept as the variant-encoded header when it does. Non-OCI paths — and OCI
+// requests that sent no Accept — produce an empty variant and an empty set,
+// preserving URL-only keying.
+func ociAwareKeyFunc(target *url.URL, r *http.Request) (CacheKey, []string) {
 	if _, _, ok := extractOCIRepository(target); ok {
-		return CacheKey{URL: target, Variant: acceptHeader(r)}
+		if accept := acceptHeader(r); accept != "" {
+			return CacheKey{URL: target, Variant: accept}, []string{"Accept"}
+		}
 	}
 
-	return CacheKey{URL: target}
+	return CacheKey{URL: target}, nil
 }
 
 // acceptHeader returns the request's complete Accept header set as a single

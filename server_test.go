@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,22 +31,25 @@ const (
 
 // fakeCache is an in-memory httpCache for testing.
 type fakeCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*cacheEntry
-	putErr   error // when set, Put fails with this error instead of storing
-	putCalls atomic.Int32
+	mu         sync.RWMutex
+	entries    map[string]*cacheEntry
+	putErr     error // when set, Put fails with this error instead of storing
+	putCalls   atomic.Int32
+	touchCalls atomic.Int32
 }
 
 type cacheEntry struct {
-	headers http.Header
-	body    []byte
+	headers  http.Header
+	body     []byte
+	storedAt time.Time // stamped by Put, advanced by Touch, settable by tests
+	version  int       // bumped by Put; surfaces as the entry's ObjectETag
 }
 
 func newFakeCache() *fakeCache {
 	return &fakeCache{entries: make(map[string]*cacheEntry)}
 }
 
-func (c *fakeCache) Head(ctx context.Context, key CacheKey) (http.Header, error) {
+func (c *fakeCache) Head(ctx context.Context, key CacheKey) (*cachedEntry, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -54,8 +58,41 @@ func (c *fakeCache) Head(ctx context.Context, key CacheKey) (http.Header, error)
 		return nil, nil //nolint:nilnil // cache interface contract
 	}
 
-	return entry.headers.Clone(), nil
+	return &cachedEntry{
+		Headers:    entry.headers.Clone(),
+		StoredAt:   entry.storedAt,
+		ObjectETag: strconv.Itoa(entry.version),
+		Size:       int64(len(entry.body)),
+	}, nil
 }
+
+// Touch mirrors the S3 contract: replace stored headers and advance
+// stored-at, conditional on the object version the caller observed.
+func (c *fakeCache) Touch(ctx context.Context, key CacheKey, entry *cachedEntry, headers http.Header) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stored, ok := c.entries[key.String()]
+	if !ok {
+		return errTouchMissingEntry
+	}
+
+	if strconv.Itoa(stored.version) != entry.ObjectETag {
+		return errTouchPrecondition
+	}
+
+	c.touchCalls.Add(1)
+
+	stored.headers = headers.Clone()
+	stored.storedAt = time.Now()
+
+	return nil
+}
+
+var (
+	errTouchMissingEntry = errors.New("touch: no such entry")
+	errTouchPrecondition = errors.New("touch: precondition failed")
+)
 
 func (c *fakeCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, error) {
 	return "http://fake-s3/" + key.URL.Host + key.URL.Path, nil
@@ -76,9 +113,16 @@ func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, 
 		return c.putErr
 	}
 
+	version := 1
+	if prior, ok := c.entries[key.String()]; ok {
+		version = prior.version + 1
+	}
+
 	c.entries[key.String()] = &cacheEntry{
-		headers: headers.Clone(),
-		body:    data,
+		headers:  headers.Clone(),
+		body:     data,
+		storedAt: time.Now(),
+		version:  version,
 	}
 
 	return nil
@@ -1624,7 +1668,11 @@ func TestOCIAwareKeyFunc_OCI_IncludesAccept(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
 	req.Header.Set("Accept", ociImageIndexMediaType)
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 1 || keyHeaders[0] != "Accept" {
+		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+	}
 
 	if key.Variant != ociImageIndexMediaType {
 		t.Errorf("expected variant %q, got %q", ociImageIndexMediaType, key.Variant)
@@ -1641,7 +1689,11 @@ func TestOCIAwareKeyFunc_NonOCI_IgnoresAccept(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
 	req.Header.Set("Accept", dockerManifestV2MediaType)
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 0 {
+		t.Errorf("expected no variant-encoded headers for non-OCI path, got %v", keyHeaders)
+	}
 
 	if key.Variant != "" {
 		t.Errorf("expected empty variant for non-OCI path, got %q", key.Variant)
@@ -1658,7 +1710,11 @@ func TestOCIAwareKeyFunc_OCI_NoAcceptHeader(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
 	// No Accept header set
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 0 {
+		t.Errorf("expected no variant-encoded headers when Accept absent, got %v", keyHeaders)
+	}
 
 	if key.Variant != "" {
 		t.Errorf("expected empty variant when Accept header absent, got %q", key.Variant)
@@ -1748,7 +1804,11 @@ func TestOCIAwareKeyFunc_OCI_MultipleAcceptHeaders(t *testing.T) {
 	req.Header.Add("Accept", "text/html, image/gif, image/jpeg, */*")
 	req.Header.Add("Accept", ociImageManifestMediaType)
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 1 || keyHeaders[0] != "Accept" {
+		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+	}
 
 	if !strings.Contains(key.Variant, ociImageManifestMediaType) {
 		t.Errorf("expected variant to contain %q, got %q", ociImageManifestMediaType, key.Variant)
