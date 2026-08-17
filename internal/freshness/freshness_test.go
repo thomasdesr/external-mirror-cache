@@ -2,6 +2,7 @@ package freshness_test
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"testing"
@@ -247,6 +248,17 @@ func TestEvaluateFailOpen(t *testing.T) {
 			wantReason: freshness.ReasonInvalidAge,
 		},
 		{
+			// An Age near the Duration ceiling must not wrap the age sum
+			// negative — a wrapped sum reads fresher than any lifetime,
+			// turning one garbage header into a permanent cache pin.
+			name:       "near-overflow Age disqualifies",
+			stored:     h("Cache-Control", "max-age=100", "Age", "9223372036"),
+			elapsed:    2 * time.Second,
+			cap:        7 * day,
+			wantFresh:  false,
+			wantReason: freshness.ReasonInvalidAge,
+		},
+		{
 			// rfc9111-freshness.AC5.1: missing stored-at degrades to
 			// revalidation, never an error.
 			name:       "zero storedAt disqualifies",
@@ -277,6 +289,30 @@ func TestEvaluateFailOpen(t *testing.T) {
 			// Conflicting duplicates are ambiguity; ambiguity fails open.
 			name:       "duplicate max-age means no lifetime",
 			stored:     h("Cache-Control", "max-age=100, max-age=200"),
+			elapsed:    0,
+			cap:        7 * day,
+			wantFresh:  false,
+			wantReason: freshness.ReasonNoLifetime,
+		},
+		{
+			// Ambiguity in the strongest directive must disqualify the
+			// lifetime outright, never surrender to a weaker directive:
+			// every s-maxage copy here says always-revalidate.
+			name: "duplicate s-maxage does not fall through to max-age",
+			//nolint:dupword // the duplicated directive is the case under test
+			stored:     h("Cache-Control", "s-maxage=0, s-maxage=0, max-age=365000000"),
+			elapsed:    0,
+			cap:        7 * day,
+			wantFresh:  false,
+			wantReason: freshness.ReasonNoLifetime,
+		},
+		{
+			name: "garbage max-age does not fall through to Expires",
+			stored: h(
+				"Cache-Control", "max-age=banana",
+				"Date", storedAt.Format(http.TimeFormat),
+				"Expires", storedAt.Add(time.Hour).Format(http.TimeFormat),
+			),
 			elapsed:    0,
 			cap:        7 * day,
 			wantFresh:  false,
@@ -393,10 +429,14 @@ func TestCapDominates(t *testing.T) {
 // k — evaluating with Age: k at elapsed e equals evaluating without Age at
 // elapsed e+k (rfc9111-freshness.AC1.5).
 func TestAgeShiftsWindowExactly(t *testing.T) {
+	// k spans the full range parseDeltaSeconds accepts, so the property
+	// also proves the accepted range cannot overflow the age sum.
+	maxValidDelta := int64(math.MaxInt64) / int64(time.Second) / 2
+
 	rapid.Check(t, func(t *rapid.T) {
 		maxAge := rapid.Int64Range(0, 1<<32).Draw(t, "maxAge")
 		capSecs := rapid.Int64Range(1, 30*86400).Draw(t, "capSecs")
-		k := rapid.Int64Range(0, 1<<20).Draw(t, "k")
+		k := rapid.Int64Range(0, maxValidDelta).Draw(t, "k")
 		e := rapid.Int64Range(0, 40*86400).Draw(t, "e")
 
 		cc := fmt.Sprintf("max-age=%d", maxAge)
@@ -413,6 +453,10 @@ func TestAgeShiftsWindowExactly(t *testing.T) {
 
 		if withAge != shifted {
 			t.Fatalf("Age:%d at +%ds = %+v, no Age at +%ds = %+v", k, e, withAge, e+k, shifted)
+		}
+
+		if withAge.Age < 0 {
+			t.Fatalf("Age:%d at +%ds computed negative age %v (overflow)", k, e, withAge.Age)
 		}
 	})
 }

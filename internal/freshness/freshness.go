@@ -111,8 +111,9 @@ type ccDirectives struct {
 }
 
 type deltaSeconds struct {
-	d  time.Duration
-	ok bool
+	d    time.Duration
+	ok   bool
+	seen bool // directive appeared at all, even duplicated or garbage
 }
 
 // parseCacheControl splits the comma-separated directive list across all
@@ -136,11 +137,18 @@ func parseCacheControl(values []string) ccDirectives {
 
 	parseOnce := func(name string) deltaSeconds {
 		args := occurrences[name]
-		if len(args) != 1 {
+		if len(args) == 0 {
 			return deltaSeconds{}
 		}
 
-		return parseDeltaSeconds(args[0])
+		if len(args) > 1 {
+			return deltaSeconds{seen: true}
+		}
+
+		parsed := parseDeltaSeconds(args[0])
+		parsed.seen = true
+
+		return parsed
 	}
 
 	return ccDirectives{
@@ -199,12 +207,16 @@ func varySatisfied(varyValues, keyHeaders []string) bool {
 // returned lifetime may be negative (Expires in the past); never fresh, by
 // the strict age comparison.
 func declaredLifetime(directives ccDirectives, stored http.Header, storedAt time.Time) (time.Duration, bool) {
-	if directives.sMaxAge.ok {
-		return directives.sMaxAge.d, true
+	// A directive that is present but duplicated or unparseable disqualifies
+	// the lifetime outright rather than falling through: surrendering to a
+	// weaker source would let ambiguity grant a window the stronger
+	// directive denied (s-maxage=0 twice must not yield max-age's year).
+	if directives.sMaxAge.seen {
+		return directives.sMaxAge.d, directives.sMaxAge.ok
 	}
 
-	if directives.maxAge.ok {
-		return directives.maxAge.d, true
+	if directives.maxAge.seen {
+		return directives.maxAge.d, directives.maxAge.ok
 	}
 
 	expiresValues := stored.Values("Expires")
@@ -261,7 +273,12 @@ func parseDeltaSeconds(s string) deltaSeconds {
 		secs = secs*10 + int64(s[i]-'0')
 	}
 
-	if secs > math.MaxInt64/int64(time.Second) {
+	// Half the Duration range, not all of it: the age arithmetic sums a
+	// stored Age with elapsed time, and a value near the full range wraps
+	// that sum negative — reading fresher than any lifetime, forever.
+	// Elapsed is now minus an S3 timestamp (decades at most, never 146
+	// years), so a half-range bound makes the sum unconditionally safe.
+	if secs > math.MaxInt64/int64(time.Second)/2 {
 		return deltaSeconds{}
 	}
 
