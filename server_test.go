@@ -2586,7 +2586,7 @@ func (tc revalidation200Case) run(t *testing.T) {
 		})},
 	}
 
-	presignedURL, err := m.fetchAndCache(ctx, key, "")
+	presignedURL, err := m.fetchAndCache(ctx, key, "", nil)
 	if err != nil {
 		t.Fatalf("fetchAndCache: %v", err)
 	}
@@ -2692,7 +2692,7 @@ func (tc notModifiedCase) run(t *testing.T) {
 		})},
 	}
 
-	presignedURL, err := m.fetchAndCache(ctx, key, "")
+	presignedURL, err := m.fetchAndCache(ctx, key, "", nil)
 
 	if !tc.wantErr {
 		if err != nil {

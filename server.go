@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
+	"github.com/thomasdesr/external-mirror-cache/internal/freshness"
 	"github.com/thomasdesr/external-mirror-cache/internal/reqlog"
 	"github.com/thomasdesr/external-mirror-cache/internal/singleflight"
 )
@@ -36,6 +38,14 @@ type cacheMiddleware struct {
 	fallback    FallbackPolicy
 	keyFunc     func(target *url.URL, r *http.Request) (CacheKey, []string)
 	uploadGroup singleflight.Group[string] // dedupes concurrent requests, returns presigned URL
+
+	// honorFreshness enables the RFC 9111 freshness gate: cached entries
+	// fresh under min(declared lifetime, freshnessCap) are served straight
+	// from the cache with no upstream request, and successful revalidations
+	// re-arm eligible entries via Touch. Off means byte-for-byte legacy
+	// behavior, new cache writes included.
+	honorFreshness bool
+	freshnessCap   time.Duration
 }
 
 func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -59,7 +69,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accept := acceptHeader(r)
-	key, _ := m.buildKey(target, r)
+	key, keyHeaders := m.buildKey(target, r)
 
 	// Singleflight ensures only one request fetches from upstream.
 	// All callers (including leader) redirect to the cached content.
@@ -67,7 +77,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// that other singleflight waiters depend on.
 	//nolint:contextcheck // intentional detached context, see comment above
 	presignedURL, err, _ := m.uploadGroup.Do(key.String(), func() (string, error) {
-		return m.fetchAndCache(context.WithoutCancel(r.Context()), key, accept)
+		return m.fetchAndCache(context.WithoutCancel(r.Context()), key, accept, keyHeaders)
 	})
 	if err != nil {
 		logger := reqlog.FromContext(r.Context())
@@ -94,7 +104,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // fetchAndCache fetches from upstream and caches to S3, returning the presigned URL.
 // Skips re-upload when upstream confirms the cached content is current: a 304,
 // or a 200 whose strong ETag matches the cached one.
-func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accept string) (string, error) {
+func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accept string, keyHeaders []string) (string, error) {
 	logger := reqlog.FromContext(ctx)
 
 	// Check cache for conditional request headers
@@ -106,6 +116,26 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	}
 
 	conditionalFetch := entry != nil
+
+	// Freshness gate: a fresh entry is served straight from the cache. The
+	// fast path never attempts upstream, so neither the fallback policy nor
+	// OCI auth participates.
+	if decision, evaluated := m.evaluateFreshness(entry, keyHeaders); evaluated {
+		if decision.Fresh {
+			logger.Info("cache decision",
+				slog.String("target", key.URL.String()),
+				slog.String("action", "fresh"),
+				slog.String("action_reason", string(decision.Reason)),
+				slog.Duration("age", decision.Age),
+				slog.Duration("declared_lifetime", decision.DeclaredLifetime),
+				slog.Duration("effective_lifetime", decision.EffectiveLifetime),
+			)
+
+			return m.presign(ctx, key)
+		}
+
+		logger = logger.With(slog.String("freshness_reason", string(decision.Reason)))
+	}
 
 	fetchType := "first"
 	if conditionalFetch {
@@ -133,6 +163,10 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 			return m.presign(ctx, key)
 		}
 
+		// The one decision path that previously logged no action; without it
+		// action-counting queries under-report errors.
+		logger.Warn("upstream response", "status", 0, "action", "error", "action_reason", err.Error())
+
 		return "", errorutil.Wrapf(err, "fetch %s (no cache available)", key.URL)
 	}
 
@@ -145,26 +179,14 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	// abandons any 200 body instead of downloading it to discard.
 	if reason, ok := upstreamUnchanged(resp, cachedHeaders); ok {
 		logger.Info("upstream response", "status", resp.StatusCode, "action", "revalidated", "action_reason", reason)
+		m.maybeTouch(ctx, key, entry, resp.Header, keyHeaders)
 
 		return m.presign(ctx, key)
 	}
 
 	// Non-200 responses - check fallback policy
 	if resp.StatusCode != http.StatusOK {
-		if conditionalFetch && m.fallback.ShouldFallback(nil, resp.StatusCode) {
-			logger.Warn("upstream response", "status", resp.StatusCode, "action", "stale")
-
-			return m.presign(ctx, key)
-		}
-
-		actionReason := "no cached content"
-		if conditionalFetch {
-			actionReason = "fallback policy denied"
-		}
-
-		logger.Info("upstream response", "status", resp.StatusCode, "action", "error", "action_reason", actionReason)
-
-		return "", &upstreamError{StatusCode: resp.StatusCode, URL: key.URL.String()}
+		return m.handleNon200(ctx, logger, key, resp.StatusCode, conditionalFetch)
 	}
 
 	// 200 OK - stream to cache
@@ -238,6 +260,63 @@ func buildUpstreamRequest(ctx context.Context, target *url.URL, accept string, c
 	}
 
 	return req, nil
+}
+
+// handleNon200 applies the fallback policy to a non-200 upstream response:
+// serve stale when the policy allows, error otherwise.
+func (m *cacheMiddleware) handleNon200(
+	ctx context.Context, logger *slog.Logger, key CacheKey, status int, conditionalFetch bool,
+) (string, error) {
+	if conditionalFetch && m.fallback.ShouldFallback(nil, status) {
+		logger.Warn("upstream response", "status", status, "action", "stale")
+
+		return m.presign(ctx, key)
+	}
+
+	actionReason := "no cached content"
+	if conditionalFetch {
+		actionReason = "fallback policy denied"
+	}
+
+	logger.Info("upstream response", "status", status, "action", "error", "action_reason", actionReason)
+
+	return "", &upstreamError{StatusCode: status, URL: key.URL.String()}
+}
+
+// evaluateFreshness runs the freshness gate when there is an entry to gate
+// and the flag is on; evaluated is false otherwise. Only this caller and
+// maybeTouch supply the wall clock — the decision function itself is pure.
+func (m *cacheMiddleware) evaluateFreshness(entry *cachedEntry, keyHeaders []string) (freshness.Decision, bool) {
+	if !m.honorFreshness || entry == nil {
+		return freshness.Decision{}, false
+	}
+
+	return freshness.Evaluate(entry.Headers, entry.StoredAt, time.Now(), m.freshnessCap, keyHeaders), true
+}
+
+// maybeTouch re-arms a revalidated entry's freshness window when doing so
+// would matter: the flag is on and the §4.3.4-merged headers pass the gate
+// at age zero. Anything else skips the write — advancing the clock of an
+// entry that can never be fresh changes no future decision, and an
+// unconditional touch would cost one S3 write per request on exactly the
+// always-revalidating hosts. Touch failures (including the 412 from a lost
+// cross-instance race) are advisory: the entry just keeps revalidating.
+func (m *cacheMiddleware) maybeTouch(ctx context.Context, key CacheKey, entry *cachedEntry, validating http.Header, keyHeaders []string) {
+	if !m.honorFreshness || entry == nil {
+		return
+	}
+
+	merged := freshness.Merge(entry.Headers, validating)
+
+	now := time.Now()
+	if decision := freshness.Evaluate(merged, now, now, m.freshnessCap, keyHeaders); !decision.Fresh {
+		return
+	}
+
+	if err := m.cache.Touch(ctx, key, entry, merged); err != nil {
+		reqlog.FromContext(ctx).Warn("touch failed; entry keeps revalidating",
+			"target", key.URL.String(), "error", err)
+	}
 }
 
 // headEntry looks up the cache entry for key, degrading lookup errors to a

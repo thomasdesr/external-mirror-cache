@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -60,6 +61,19 @@ var (
 			" fall back to stale, cache-miss returns 502; 0 disables"+
 			" (env: MIRROR_CACHE_RESPONSE_HEADER_TIMEOUT)",
 	)
+
+	honorFreshnessStr = flag.String(
+		"honor-freshness",
+		envDefault("MIRROR_CACHE_HONOR_FRESHNESS", "false"),
+		"serve fresh cache hits without revalidating; gates both the fresh"+
+			" fast path and the revalidation touch (env: MIRROR_CACHE_HONOR_FRESHNESS)",
+	)
+	freshnessCapStr = flag.String(
+		"freshness-cap",
+		envDefault("MIRROR_CACHE_FRESHNESS_CAP", "168h"),
+		"global upper bound on any upstream-declared freshness lifetime"+
+			" (env: MIRROR_CACHE_FRESHNESS_CAP)",
+	)
 )
 
 func main() {
@@ -86,6 +100,16 @@ func run() error {
 	}
 
 	clientTimeout, responseHeaderTimeout, err := parseTimeoutFlags()
+	if err != nil {
+		return err
+	}
+
+	honorFreshness, err := strconv.ParseBool(*honorFreshnessStr)
+	if err != nil {
+		return errorutil.Wrapf(err, "invalid --honor-freshness value %q", *honorFreshnessStr)
+	}
+
+	freshnessCap, err := parseDuration(*freshnessCapStr, "freshness-cap")
 	if err != nil {
 		return err
 	}
@@ -119,7 +143,9 @@ func run() error {
 			On5xx:             *staleOn5xx,
 			OnAnyError:        *staleOnAnyError,
 		},
-		keyFunc: ociAwareKeyFunc,
+		keyFunc:        ociAwareKeyFunc,
+		honorFreshness: honorFreshness,
+		freshnessCap:   freshnessCap,
 	}
 
 	ln, err := getListener(*listen)
