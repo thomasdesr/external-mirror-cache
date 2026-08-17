@@ -145,18 +145,27 @@ func (c *fakeCache) get(u string) *cacheEntry {
 // newTestServer creates a caching proxy backed by fakeCache and the given upstream.
 // The upstream should be a TLS server since parseTargetURL always uses HTTPS scheme.
 func newTestServer(upstream *httptest.Server, cache *fakeCache) *httptest.Server {
-	return newTestServerWithFallback(upstream, cache, FallbackPolicy{})
+	return newTestServerWith(upstream, cache, nil)
 }
 
 func newTestServerWithFallback(upstream *httptest.Server, cache *fakeCache, fallback FallbackPolicy) *httptest.Server {
+	return newTestServerWith(upstream, cache, func(m *cacheMiddleware) { m.fallback = fallback })
+}
+
+// newTestServerWith is the one place test middleware is constructed;
+// configure adjusts the middleware before it starts serving.
+func newTestServerWith(upstream *httptest.Server, cache *fakeCache, configure func(*cacheMiddleware)) *httptest.Server {
 	upstreamClient := upstream.Client()
 	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
 
 	handler := &cacheMiddleware{
-		cache:    cache,
-		client:   upstreamClient,
-		fallback: fallback,
-		keyFunc:  ociAwareKeyFunc,
+		cache:   cache,
+		client:  upstreamClient,
+		keyFunc: ociAwareKeyFunc,
+	}
+
+	if configure != nil {
+		configure(handler)
 	}
 
 	return httptest.NewServer(handler)
