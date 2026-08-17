@@ -169,12 +169,11 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	// 200 OK - stream to cache
 	err = m.cache.Put(ctx, key, resp.Header, bufio.NewReader(resp.Body))
 	if err != nil {
-		if conditionalFetch && m.fallback.ShouldFallback(err, 0) {
-			logger.Warn("cache write failed", "action", "stale", "action_reason", err.Error())
-
-			return m.presign(ctx, key)
-		}
-
+		// Deliberately no stale fallback: the policy governs upstream
+		// failures, and a cache-write failure is the mirror's own
+		// infrastructure (S3) in trouble. Serving stale here would mask it --
+		// a warm cache would hide a broken write path until content changed,
+		// pinning clients to old bytes with no visible error anywhere.
 		return "", errorutil.Wrapf(err, "cache %s", key.URL)
 	}
 

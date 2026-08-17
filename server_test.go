@@ -922,13 +922,22 @@ func newChangingUpstream() *httptest.Server {
 	}))
 }
 
-func TestIntegration_CacheWriteFailure_ServesStaleWithFallback(t *testing.T) {
+// TestIntegration_CacheWriteFailure_AlwaysErrors pins an operator decision:
+// the stale-serving policy governs upstream failures only. A cache-write
+// failure is mirror infrastructure (S3) in trouble, which must surface as a
+// loud, distinguishable error rather than be masked by stale-serving -- even
+// under the most permissive policy, and even with a serviceable stale copy.
+func TestIntegration_CacheWriteFailure_AlwaysErrors(t *testing.T) {
 	upstream := newChangingUpstream()
 	defer upstream.Close()
 
 	cache := newFakeCache()
 
-	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{OnAnyError: true})
+	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{
+		OnConnectionError: true,
+		On5xx:             true,
+		OnAnyError:        true,
+	})
 	defer proxy.Close()
 
 	proxyPath := upstreamHostPath(upstream, "/put-fail.txt")
@@ -951,46 +960,7 @@ func TestIntegration_CacheWriteFailure_ServesStaleWithFallback(t *testing.T) {
 		t.Fatalf("expected 303 redirect, got %d", resp1.StatusCode)
 	}
 
-	// Second request: content changed upstream, cache write fails. The stale
-	// copy is valid and the policy allows serving it.
-	cache.setPutError(errSimulatedPutFailure)
-
-	resp2, err := client.Get(proxy.URL + proxyPath)
-	if err != nil {
-		t.Fatalf("second request failed: %v", err)
-	}
-
-	resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusSeeOther {
-		t.Errorf("expected 303 redirect (stale fallback on cache write failure), got %d", resp2.StatusCode)
-	}
-}
-
-func TestIntegration_CacheWriteFailure_FallbackDisabled_Errors(t *testing.T) {
-	upstream := newChangingUpstream()
-	defer upstream.Close()
-
-	cache := newFakeCache()
-
-	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{})
-	defer proxy.Close()
-
-	proxyPath := upstreamHostPath(upstream, "/put-fail-no-fallback.txt")
-
-	client := &http.Client{
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		},
-	}
-
-	resp1, err := client.Get(proxy.URL + proxyPath)
-	if err != nil {
-		t.Fatalf("first request failed: %v", err)
-	}
-
-	resp1.Body.Close()
-
+	// Second request: content changed upstream, cache write fails.
 	cache.setPutError(errSimulatedPutFailure)
 
 	resp2, err := client.Get(proxy.URL + proxyPath)
@@ -1000,34 +970,16 @@ func TestIntegration_CacheWriteFailure_FallbackDisabled_Errors(t *testing.T) {
 	defer resp2.Body.Close()
 
 	if resp2.StatusCode != http.StatusBadGateway {
-		t.Errorf("expected 502 when fallback disabled, got %d", resp2.StatusCode)
+		t.Fatalf("expected 502 on cache write failure, got %d", resp2.StatusCode)
 	}
-}
 
-// TestIntegration_CacheWriteFailure_NoCachedCopy_ErrorsEvenWithFallback pins
-// that stale fallback on a cache write failure requires a cached copy to fall
-// back TO: presigning without one would redirect clients to an S3 404.
-func TestIntegration_CacheWriteFailure_NoCachedCopy_ErrorsEvenWithFallback(t *testing.T) {
-	upstream := newChangingUpstream()
-	defer upstream.Close()
-
-	cache := newFakeCache()
-	cache.setPutError(errSimulatedPutFailure)
-
-	proxy := newTestServerWithFallback(upstream, cache, FallbackPolicy{OnAnyError: true})
-	defer proxy.Close()
-
-	proxyPath := upstreamHostPath(upstream, "/put-fail-cold.txt")
-
-	resp, err := http.Get(proxy.URL + proxyPath)
+	body, err := io.ReadAll(resp2.Body)
 	if err != nil {
-		t.Fatalf("request failed: %v", err)
+		t.Fatalf("read body: %v", err)
 	}
 
-	resp.Body.Close()
-
-	if resp.StatusCode != http.StatusBadGateway {
-		t.Errorf("expected 502 on cache write failure with nothing cached, got %d", resp.StatusCode)
+	if !strings.Contains(string(body), "mirror-cache") {
+		t.Errorf("cache-write-failure body %q must name the mirror, not read as an upstream response", body)
 	}
 }
 
