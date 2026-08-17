@@ -163,8 +163,9 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 			return m.presign(ctx, key)
 		}
 
-		// The one decision path that previously logged no action; without it
-		// action-counting queries under-report errors.
+		// Every fetch decision logs exactly one action; without this line,
+		// error decisions with no cached fallback are invisible to
+		// action-counting queries.
 		logger.Warn("upstream response", "status", 0, "action", "error", "action_reason", err.Error())
 
 		return "", errorutil.Wrapf(err, "fetch %s (no cache available)", key.URL)
@@ -179,7 +180,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 	// abandons any 200 body instead of downloading it to discard.
 	if reason, ok := upstreamUnchanged(resp, cachedHeaders); ok {
 		logger.Info("upstream response", "status", resp.StatusCode, "action", "revalidated", "action_reason", reason)
-		m.maybeTouch(ctx, key, entry, resp.Header, keyHeaders)
+		m.maybeTouch(ctx, logger, key, entry, resp.Header, keyHeaders)
 
 		return m.presign(ctx, key)
 	}
@@ -301,8 +302,20 @@ func (m *cacheMiddleware) evaluateFreshness(entry *cachedEntry, keyHeaders []str
 // unconditional touch would cost one S3 write per request on exactly the
 // always-revalidating hosts. Touch failures (including the 412 from a lost
 // cross-instance race) are advisory: the entry just keeps revalidating.
-func (m *cacheMiddleware) maybeTouch(ctx context.Context, key CacheKey, entry *cachedEntry, validating http.Header, keyHeaders []string) {
+func (m *cacheMiddleware) maybeTouch(
+	ctx context.Context, logger *slog.Logger, key CacheKey, entry *cachedEntry, validating http.Header, keyHeaders []string,
+) {
 	if !m.honorFreshness || entry == nil {
+		return
+	}
+
+	// RFC 9111 §4.3.4: a validating response carrying a different strong
+	// validator must not update the stored entry. An IMS-only revalidator
+	// answering 304 for changed content advertises the new ETag; touching
+	// would relabel the old body with it and poison every future
+	// revalidation (the stale body would strong-match forever). A response
+	// with no ETag is safe: the merge retains the stored validators.
+	if vet := validating.Get("Etag"); vet != "" && !etagStrongMatch(entry.Headers.Get("Etag"), vet) {
 		return
 	}
 
@@ -314,8 +327,7 @@ func (m *cacheMiddleware) maybeTouch(ctx context.Context, key CacheKey, entry *c
 	}
 
 	if err := m.cache.Touch(ctx, key, entry, merged); err != nil {
-		reqlog.FromContext(ctx).Warn("touch failed; entry keeps revalidating",
-			"target", key.URL.String(), "error", err)
+		logger.Warn("touch failed; entry keeps revalidating", "error", err)
 	}
 }
 

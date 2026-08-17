@@ -11,18 +11,10 @@ import (
 
 // newTestServerWithFreshness is newTestServer with the freshness gate on.
 func newTestServerWithFreshness(upstream *httptest.Server, cache *fakeCache, freshnessCap time.Duration) *httptest.Server {
-	upstreamClient := upstream.Client()
-	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
-
-	handler := &cacheMiddleware{
-		cache:          cache,
-		client:         upstreamClient,
-		keyFunc:        ociAwareKeyFunc,
-		honorFreshness: true,
-		freshnessCap:   freshnessCap,
-	}
-
-	return httptest.NewServer(handler)
+	return newTestServerWith(upstream, cache, func(m *cacheMiddleware) {
+		m.honorFreshness = true
+		m.freshnessCap = freshnessCap
+	})
 }
 
 const testFreshETag = `"v1"`
@@ -371,8 +363,8 @@ func TestFreshness_CapBoundsDeclaredLifetime(t *testing.T) {
 	cachedURL := cachedURLFor(upstream, "/pkg.whl")
 
 	mustGet303(t, client, target)
-	ageEntry(t, cache, cachedURL, 2*time.Hour) // past the cap, well inside max-age
-	mustGet303(t, client, target)              // cap-expired: must revalidate
+	ageEntry(t, cache, cachedURL, 90*time.Minute) // past the cap, well inside max-age
+	mustGet303(t, client, target)                 // cap-expired: must revalidate
 
 	if hits := upstreamHits.Load(); hits != 2 {
 		t.Errorf("upstream hits = %d, want 2 (cap must bound the declared year)", hits)
@@ -431,5 +423,60 @@ func TestFreshness_OCIVariantKeysCanBeFresh(t *testing.T) {
 
 	if hits := upstreamHits.Load(); hits != 2 {
 		t.Errorf("upstream hits = %d, want 2 (distinct variants evaluated independently)", hits)
+	}
+}
+
+// TestFreshness_MismatchedETagOn304SkipsTouch pins RFC 9111 §4.3.4's MUST
+// NOT: a 304 whose ETag doesn't strong-match the stored one (an IMS-only
+// revalidator answering for changed content) must not update the entry —
+// touching would relabel the old body with the new validator and poison
+// every future revalidation.
+func TestFreshness_MismatchedETagOn304SkipsTouch(t *testing.T) {
+	var upstreamHits atomic.Int32
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		if r.Header.Get("If-None-Match") == testFreshETag {
+			// Content changed upstream, but this revalidator only checks
+			// If-Modified-Since: it 304s while advertising the new ETag.
+			w.Header().Set("Cache-Control", "max-age=3600")
+			w.Header().Set("ETag", `"v2"`)
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("ETag", testFreshETag)
+		w.Write([]byte("body v1"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServerWithFreshness(upstream, cache, 7*24*time.Hour)
+
+	defer proxy.Close()
+
+	client := noRedirectClient()
+	target := proxy.URL + upstreamHostPath(upstream, "/artifact")
+	cachedURL := cachedURLFor(upstream, "/artifact")
+
+	mustGet303(t, client, target)
+	ageEntry(t, cache, cachedURL, 2*time.Hour)
+	mustGet303(t, client, target) // 304 with mismatched ETag: no touch
+
+	if calls := cache.touchCalls.Load(); calls != 0 {
+		t.Errorf("touch calls = %d, want 0 (mismatched validator must not update the entry)", calls)
+	}
+
+	if got := cache.get(cachedURL).headers.Get("ETag"); got != testFreshETag {
+		t.Errorf("stored ETag = %q, want unchanged %q", got, testFreshETag)
+	}
+
+	mustGet303(t, client, target) // still stale: revalidates again
+
+	if hits := upstreamHits.Load(); hits != 3 {
+		t.Errorf("upstream hits = %d, want 3 (entry must keep revalidating)", hits)
 	}
 }
