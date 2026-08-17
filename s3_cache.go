@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -122,7 +123,7 @@ func (c *s3HTTPCache) Touch(ctx context.Context, key CacheKey, entry *cachedEntr
 	_, err = c.s3c.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:            aws.String(c.bucket),
 		Key:               aws.String(s3Path),
-		CopySource:        aws.String((&url.URL{Path: c.bucket + "/" + s3Path}).EscapedPath()),
+		CopySource:        aws.String(escapeCopySource(c.bucket + "/" + s3Path)),
 		CopySourceIfMatch: aws.String(entry.ObjectETag),
 		MetadataDirective: types.MetadataDirectiveReplace,
 		Metadata:          metadata,
@@ -135,6 +136,30 @@ func (c *s3HTTPCache) Touch(ctx context.Context, key CacheKey, entry *cachedEntr
 	logger.Debug("touched cache entry", "bucket", c.bucket, "key", s3Path)
 
 	return nil
+}
+
+// escapeCopySource percent-encodes a bucket/key path for the
+// x-amz-copy-source header, leaving only RFC 3986 unreserved characters and
+// '/' literal. S3 applies query-style decoding to this header — a literal
+// '+' reads back as a space, so a URL-path encoding (which keeps '+') makes
+// the copy 404 for any key containing one (PyPI local-version wheels like
+// torch-2.1.0+cpu). First-party SDKs (botocore, Java v2) encode this same
+// character set.
+func escapeCopySource(s string) string {
+	var b strings.Builder
+
+	for i := range len(s) {
+		c := s[i]
+		switch {
+		case 'A' <= c && c <= 'Z', 'a' <= c && c <= 'z', '0' <= c && c <= '9',
+			c == '-', c == '.', c == '_', c == '~', c == '/':
+			b.WriteByte(c)
+		default:
+			fmt.Fprintf(&b, "%%%02X", c)
+		}
+	}
+
+	return b.String()
 }
 
 // GetPresignedURL returns a presigned S3 URL for the provided key. This does

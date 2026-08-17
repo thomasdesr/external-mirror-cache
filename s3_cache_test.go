@@ -573,3 +573,25 @@ func TestTouchEscapesCopySource(t *testing.T) {
 		t.Errorf("CopySource %q contains unescaped '?'", got)
 	}
 }
+
+// TestTouchEncodesPlusInCopySource: S3 applies query-style decoding to
+// x-amz-copy-source, so a literal '+' reads as a space and the copy 404s.
+// PyPI local-version wheels (torch-2.1.0+cpu) put '+' in cache keys.
+func TestTouchEncodesPlusInCopySource(t *testing.T) {
+	fake := &fakeS3ObjectClient{}
+	cache := &s3HTTPCache{s3c: fake, bucket: "b", prefix: "cache"}
+	key := CacheKey{URL: &url.URL{Scheme: "https", Host: "files.pythonhosted.org", Path: "/torch-2.1.0+cpu.whl"}}
+
+	if err := cache.Touch(context.Background(), key, &cachedEntry{ObjectETag: `"v"`, Size: 1}, http.Header{}); err != nil {
+		t.Fatalf("Touch() error: %v", err)
+	}
+
+	got := aws.ToString(fake.copyInput.CopySource)
+	if strings.Contains(got, "+") {
+		t.Errorf("CopySource %q contains literal '+', want %%2B", got)
+	}
+
+	if want := "b/cache/files.pythonhosted.org/torch-2.1.0%2Bcpu.whl"; got != want {
+		t.Errorf("CopySource = %q, want %q", got, want)
+	}
+}
