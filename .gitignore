@@ -2,14 +2,16 @@
 .nix/
 CLAUDE.local.md
 
-# Build artifacts
-external-mirror-cache
-external-mirror-cache_linux_*/
-mirror-cache
-mirror-cache-arm64
-smokescreen-arm64
+# Build artifacts, anchored to the repo root so binary names never match
+# unrelated directories.
+/external-mirror-cache
+/external-mirror-cache_linux_*/
+/mirror-cache
+/mirror-cache-arm64
+/smokescreen-arm64
 
-# Terraform local state
+# Deployment config is internal and never committed.
+/terraform/
 .terraform/
 *.tfstate
 *.tfstate.backup
