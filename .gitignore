@@ -1,5 +1,6 @@
 .direnv/
 .nix/
+CLAUDE.local.md
 
 # Build artifacts
 external-mirror-cache
