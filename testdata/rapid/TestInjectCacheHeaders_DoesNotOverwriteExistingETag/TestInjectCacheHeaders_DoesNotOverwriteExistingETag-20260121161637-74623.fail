@@ -1,0 +1,17 @@
+# 2026/01/21 16:16:37.911746 [TestInjectCacheHeaders_DoesNotOverwriteExistingETag] [rapid] draw cachedETag: "\"-\""
+# 2026/01/21 16:16:37.911778 [TestInjectCacheHeaders_DoesNotOverwriteExistingETag] [rapid] draw existingETag: "\"-\""
+# 2026/01/21 16:16:37.911781 [TestInjectCacheHeaders_DoesNotOverwriteExistingETag] expected If-None-Match "\"-\"", got ""
+#
+v0.4.8#2632188924386330063
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0

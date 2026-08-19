@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,22 +31,25 @@ const (
 
 // fakeCache is an in-memory httpCache for testing.
 type fakeCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*cacheEntry
-	putErr   error // when set, Put fails with this error instead of storing
-	putCalls atomic.Int32
+	mu         sync.RWMutex
+	entries    map[string]*cacheEntry
+	putErr     error // when set, Put fails with this error instead of storing
+	putCalls   atomic.Int32
+	touchCalls atomic.Int32
 }
 
 type cacheEntry struct {
-	headers http.Header
-	body    []byte
+	headers  http.Header
+	body     []byte
+	storedAt time.Time // stamped by Put, advanced by Touch, settable by tests
+	version  int       // bumped by Put; surfaces as the entry's ObjectETag
 }
 
 func newFakeCache() *fakeCache {
 	return &fakeCache{entries: make(map[string]*cacheEntry)}
 }
 
-func (c *fakeCache) Head(ctx context.Context, key CacheKey) (http.Header, error) {
+func (c *fakeCache) Head(ctx context.Context, key CacheKey) (*cachedEntry, error) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
@@ -54,8 +58,41 @@ func (c *fakeCache) Head(ctx context.Context, key CacheKey) (http.Header, error)
 		return nil, nil //nolint:nilnil // cache interface contract
 	}
 
-	return entry.headers.Clone(), nil
+	return &cachedEntry{
+		Headers:    entry.headers.Clone(),
+		StoredAt:   entry.storedAt,
+		ObjectETag: strconv.Itoa(entry.version),
+		Size:       int64(len(entry.body)),
+	}, nil
 }
+
+// Touch mirrors the S3 contract: replace stored headers and advance
+// stored-at, conditional on the object version the caller observed.
+func (c *fakeCache) Touch(ctx context.Context, key CacheKey, entry *cachedEntry, headers http.Header) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	stored, ok := c.entries[key.String()]
+	if !ok {
+		return errTouchMissingEntry
+	}
+
+	if strconv.Itoa(stored.version) != entry.ObjectETag {
+		return errTouchPrecondition
+	}
+
+	c.touchCalls.Add(1)
+
+	stored.headers = headers.Clone()
+	stored.storedAt = time.Now()
+
+	return nil
+}
+
+var (
+	errTouchMissingEntry = errors.New("touch: no such entry")
+	errTouchPrecondition = errors.New("touch: precondition failed")
+)
 
 func (c *fakeCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, error) {
 	return "http://fake-s3/" + key.URL.Host + key.URL.Path, nil
@@ -76,9 +113,16 @@ func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, 
 		return c.putErr
 	}
 
+	version := 1
+	if prior, ok := c.entries[key.String()]; ok {
+		version = prior.version + 1
+	}
+
 	c.entries[key.String()] = &cacheEntry{
-		headers: headers.Clone(),
-		body:    data,
+		headers:  headers.Clone(),
+		body:     data,
+		storedAt: time.Now(),
+		version:  version,
 	}
 
 	return nil
@@ -101,18 +145,27 @@ func (c *fakeCache) get(u string) *cacheEntry {
 // newTestServer creates a caching proxy backed by fakeCache and the given upstream.
 // The upstream should be a TLS server since parseTargetURL always uses HTTPS scheme.
 func newTestServer(upstream *httptest.Server, cache *fakeCache) *httptest.Server {
-	return newTestServerWithFallback(upstream, cache, FallbackPolicy{})
+	return newTestServerWith(upstream, cache, nil)
 }
 
 func newTestServerWithFallback(upstream *httptest.Server, cache *fakeCache, fallback FallbackPolicy) *httptest.Server {
+	return newTestServerWith(upstream, cache, func(m *cacheMiddleware) { m.fallback = fallback })
+}
+
+// newTestServerWith is the one place test middleware is constructed;
+// configure adjusts the middleware before it starts serving.
+func newTestServerWith(upstream *httptest.Server, cache *fakeCache, configure func(*cacheMiddleware)) *httptest.Server {
 	upstreamClient := upstream.Client()
 	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
 
 	handler := &cacheMiddleware{
-		cache:    cache,
-		client:   upstreamClient,
-		fallback: fallback,
-		keyFunc:  ociAwareKeyFunc,
+		cache:   cache,
+		client:  upstreamClient,
+		keyFunc: ociAwareKeyFunc,
+	}
+
+	if configure != nil {
+		configure(handler)
 	}
 
 	return httptest.NewServer(handler)
@@ -426,6 +479,47 @@ func TestIntegration_RangeRequestCachesFullFile(t *testing.T) {
 
 	if string(entry.body) != fullContent {
 		t.Errorf("expected full content cached, got %q", entry.body)
+	}
+}
+
+// TestIntegration_ClientAcceptEncodingNotForwarded pins the premise the
+// freshness Vary guard's Accept-Encoding exemption stands on: the client's
+// Accept-Encoding never reaches upstream (the transport sends its own
+// uniform value), so the cache holds one encoding variant per key. If this
+// test starts failing, the exemption in varySatisfied is unsound.
+func TestIntegration_ClientAcceptEncodingNotForwarded(t *testing.T) {
+	var upstreamAcceptEncoding string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAcceptEncoding = r.Header.Get("Accept-Encoding")
+
+		w.Write([]byte("content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+upstreamHostPath(upstream, "/file.bin"), nil)
+	req.Header.Set("Accept-Encoding", "br;q=1.0, identity;q=0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if strings.Contains(upstreamAcceptEncoding, "br") {
+		t.Errorf("client Accept-Encoding forwarded to upstream: got %q", upstreamAcceptEncoding)
 	}
 }
 
@@ -1624,7 +1718,11 @@ func TestOCIAwareKeyFunc_OCI_IncludesAccept(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
 	req.Header.Set("Accept", ociImageIndexMediaType)
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 1 || keyHeaders[0] != "Accept" {
+		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+	}
 
 	if key.Variant != ociImageIndexMediaType {
 		t.Errorf("expected variant %q, got %q", ociImageIndexMediaType, key.Variant)
@@ -1641,7 +1739,11 @@ func TestOCIAwareKeyFunc_NonOCI_IgnoresAccept(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
 	req.Header.Set("Accept", dockerManifestV2MediaType)
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 0 {
+		t.Errorf("expected no variant-encoded headers for non-OCI path, got %v", keyHeaders)
+	}
 
 	if key.Variant != "" {
 		t.Errorf("expected empty variant for non-OCI path, got %q", key.Variant)
@@ -1658,7 +1760,11 @@ func TestOCIAwareKeyFunc_OCI_NoAcceptHeader(t *testing.T) {
 	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
 	// No Accept header set
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 0 {
+		t.Errorf("expected no variant-encoded headers when Accept absent, got %v", keyHeaders)
+	}
 
 	if key.Variant != "" {
 		t.Errorf("expected empty variant when Accept header absent, got %q", key.Variant)
@@ -1748,7 +1854,11 @@ func TestOCIAwareKeyFunc_OCI_MultipleAcceptHeaders(t *testing.T) {
 	req.Header.Add("Accept", "text/html, image/gif, image/jpeg, */*")
 	req.Header.Add("Accept", ociImageManifestMediaType)
 
-	key := ociAwareKeyFunc(u, req)
+	key, keyHeaders := ociAwareKeyFunc(u, req)
+
+	if len(keyHeaders) != 1 || keyHeaders[0] != "Accept" {
+		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+	}
 
 	if !strings.Contains(key.Variant, ociImageManifestMediaType) {
 		t.Errorf("expected variant to contain %q, got %q", ociImageManifestMediaType, key.Variant)
@@ -2526,7 +2636,7 @@ func (tc revalidation200Case) run(t *testing.T) {
 		})},
 	}
 
-	presignedURL, err := m.fetchAndCache(ctx, key, "")
+	presignedURL, err := m.fetchAndCache(ctx, key, "", nil)
 	if err != nil {
 		t.Fatalf("fetchAndCache: %v", err)
 	}
@@ -2632,7 +2742,7 @@ func (tc notModifiedCase) run(t *testing.T) {
 		})},
 	}
 
-	presignedURL, err := m.fetchAndCache(ctx, key, "")
+	presignedURL, err := m.fetchAndCache(ctx, key, "", nil)
 
 	if !tc.wantErr {
 		if err != nil {

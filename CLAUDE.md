@@ -1,6 +1,6 @@
 # Mirror Cache
 
-Last verified: 2026-05-08
+Last verified: 2026-08-17
 
 ## Scope & Boundaries
 
@@ -56,24 +56,26 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 **Request flow:**
 1. Client requests `/<domain>/<path>` (e.g., `/example.com/file.txt`)
 2. `reqlog.Middleware` assigns a request ID and structured logger to the context
-3. `keyFunc` builds a `CacheKey` from the target URL and request (OCI paths include Accept header as variant; non-OCI paths use URL only)
-4. Server checks S3 for cached response headers (ETag, Last-Modified) using the `CacheKey`
-5. If cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since` (and Accept header if present)
-6. On 304 Not Modified -- or a 200 whose strong ETag matches the cached one (some upstreams ignore conditional headers) -- redirects client to S3 presigned URL without re-uploading
-7. On any other 200 OK: streams response to S3 cache, then redirects client. A cache-write failure always errors -- S3 trouble is mirror infrastructure and must surface, never be masked by stale-serving
+3. `keyFunc` builds a `CacheKey` from the target URL and request, and reports which header names the key's variant encodes (OCI paths with an Accept header encode Accept; everything else is URL-only)
+4. Server checks S3 for the cached entry (stored headers plus S3 LastModified, object ETag, and size) using the `CacheKey`
+5. With `--honor-freshness`: an entry that is fresh under RFC 9111 arithmetic -- Age-corrected current age under the declared lifetime AND resident time (now minus stored-at) under `--freshness-cap`, no-cache and Vary guarded (`internal/freshness`) -- redirects straight to the S3 presigned URL with zero upstream traffic. The cap bounds time since our last validation, not CDN residency reported in `Age`
+6. Otherwise, if cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since` (and Accept header if present)
+7. On 304 Not Modified -- or a 200 whose strong ETag matches the cached one (some upstreams ignore conditional headers) -- redirects client to S3 presigned URL without re-uploading. With the flag on, if the §4.3.4-merged headers would make the entry fresh at the instant of the touch -- resident time zero, though the response's Age still counts against the declared lifetime -- (and the response's ETag doesn't contradict the stored one), the entry is *touched*: a conditional S3 metadata self-copy that re-arms its freshness window without a body re-upload
+8. On any other 200 OK: streams response to S3 cache, then redirects client. A cache-write failure always errors -- S3 trouble is mirror infrastructure and must surface, never be masked by stale-serving
 
 Upstream redirects are followed before caching -- the cache key is the original requested URL (plus variant if applicable), not the final redirect destination.
 
 **Key components:**
 - `server.go` - Main HTTP handler (`cacheMiddleware`): parses `/<domain>/<path>` requests, builds a `CacheKey` via pluggable `keyFunc`, checks S3 cache, fetches upstream with singleflight dedup (keyed on `CacheKey.String()`), forwards Accept header to upstream, redirects clients to presigned S3 URLs. `ociAwareKeyFunc` includes Accept as the variant for `/v2/` OCI paths; non-OCI paths use URL-only keys
-- `cache.go` - `CacheKey` type (URL + Variant) and `httpCache` interface: `Head`, `Put`, `GetPresignedURL` (all take `CacheKey`)
-- `s3_cache.go` - S3 implementation of `httpCache`: stores responses and serves presigned URLs. S3 path is `<prefix>/<host>/<path>` for URL-only keys, with `//<variant>` appended for variant keys
+- `cache.go` - `CacheKey` type (URL + Variant), the `cachedEntry` record (headers, stored-at, object ETag, size), and the `httpCache` interface: `Head`, `Put`, `GetPresignedURL`, `Touch` (all take `CacheKey`)
+- `s3_cache.go` - S3 implementation of `httpCache`: stores responses, serves presigned URLs, and implements `Touch` as a CopyObject metadata self-copy -- conditional on the Head-time object ETag so a touch racing a concurrent `Put` loses with a 412, re-supplying ContentType (REPLACE resets system metadata), skipping objects over the 5GB single-part copy limit. S3 path is `<prefix>/<host>/<path>` for URL-only keys, with `//<variant>` appended for variant keys
 - `s3_metadata.go` - Serializes HTTP headers to/from S3 object metadata as JSON. Writes only an allowlisted subset (validators, entity headers, freshness fields) -- S3 caps user metadata at 2KB and full upstream header sets exceed it; reads stay permissive for the pre-allowlist corpus
 - `fallback.go` - `FallbackPolicy`: controls when stale cached content is served on upstream errors. Upstream only by design: cache-write (S3) failures never consult it
 - `http_caching.go` - Injects conditional request headers from cached headers
 - `oci_auth.go` - OCI Bearer token auth transport. Intercepts 401 challenges from OCI registries (e.g., Docker Hub), fetches anonymous tokens, caches them with TTL, and retries. Uses singleflight to deduplicate concurrent token fetches. Proactive path reuses cached challenges to avoid discovery round-trips. Only activates for `/v2/` OCI paths; non-OCI requests and requests with existing Authorization headers pass through. Transport chain: `http.Client` -> `ociAuthTransport` -> `http.Transport`
 
 **Internal packages:**
+- `internal/freshness` - The RFC 9111 freshness gate (pure function of stored headers, stored-at, now, cap, variant-encoded key headers) and the §4.3.4 header merge. Every parse ambiguity fails open to revalidation; design in `docs/design-plans/2026-08-04-rfc9111-freshness.md`
 - `internal/reqlog` - Per-request structured logging: context helpers, request ID, HTTP middleware
 - `internal/errorutil` - Error wrapping via `fmt.Errorf`
 - `internal/etagging-server` - Test file server with auto-generated ETags
@@ -96,6 +98,10 @@ Stale-serving flags:
 Upstream timeout flags:
 - `--response-header-timeout` / `MIRROR_CACHE_RESPONSE_HEADER_TIMEOUT` (default `5s`) -- max wait for upstream response headers; conditional fetches fall back to stale on timeout, cache-miss returns 502; `0` disables
 - `--client-timeout` / `MIRROR_CACHE_CLIENT_TIMEOUT` (default `120s`) -- overall `http.Client.Timeout`, bounds total upstream request time including body streaming; `0` disables
+
+Freshness flags:
+- `--honor-freshness` / `MIRROR_CACHE_HONOR_FRESHNESS` (default `false`) -- serve fresh cache hits without revalidating; gates both the fresh fast path and the revalidation touch
+- `--freshness-cap` / `MIRROR_CACHE_FRESHNESS_CAP` (default `168h`) -- max resident time before a fresh-eligible entry revalidates; `0` means nothing is ever served fresh (not "disable the bound")
 
 ## Logging
 

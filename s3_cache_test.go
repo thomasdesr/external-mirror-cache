@@ -2,12 +2,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/transfermanager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 
 	"pgregory.net/rapid"
 )
@@ -407,5 +412,186 @@ func TestS3PathForSpecialCharactersEscaped(t *testing.T) {
 				t.Errorf("s3PathFor with Variant %q: got %q, want suffix %q", tc.variant, result, tc.expectedSuffix)
 			}
 		})
+	}
+}
+
+// fakeS3ObjectClient is a spy s3ObjectClient: HeadObject serves canned
+// output, CopyObject records its input and returns a configurable error.
+type fakeS3ObjectClient struct {
+	headOutput *s3.HeadObjectOutput
+	headErr    error
+
+	copyInput *s3.CopyObjectInput
+	copyCalls int
+	copyErr   error
+}
+
+func (f *fakeS3ObjectClient) HeadObject(_ context.Context, _ *s3.HeadObjectInput, _ ...func(*s3.Options)) (*s3.HeadObjectOutput, error) {
+	return f.headOutput, f.headErr
+}
+
+func (f *fakeS3ObjectClient) CopyObject(
+	_ context.Context, input *s3.CopyObjectInput, _ ...func(*s3.Options),
+) (*s3.CopyObjectOutput, error) {
+	f.copyCalls++
+	f.copyInput = input
+
+	return &s3.CopyObjectOutput{}, f.copyErr
+}
+
+var testKey = CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/pkg.whl"}}
+
+// TestHeadReturnsEntry verifies Head populates the cachedEntry from the
+// HeadObject reply: headers from metadata, StoredAt from LastModified,
+// ObjectETag and Size for the conditional touch.
+func TestHeadReturnsEntry(t *testing.T) {
+	storedAt := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	fake := &fakeS3ObjectClient{headOutput: &s3.HeadObjectOutput{
+		Metadata:      map[string]string{"Cache-Control": `["max-age=60"]`},
+		LastModified:  aws.Time(storedAt),
+		ETag:          aws.String(`"s3-object-etag"`),
+		ContentLength: aws.Int64(1024),
+	}}
+	cache := &s3HTTPCache{s3c: fake, bucket: "b", prefix: "cache"}
+
+	entry, err := cache.Head(context.Background(), testKey)
+	if err != nil {
+		t.Fatalf("Head() error: %v", err)
+	}
+
+	if got := entry.Headers.Get("Cache-Control"); got != "max-age=60" {
+		t.Errorf("Headers[Cache-Control] = %q, want %q", got, "max-age=60")
+	}
+
+	if !entry.StoredAt.Equal(storedAt) {
+		t.Errorf("StoredAt = %v, want %v", entry.StoredAt, storedAt)
+	}
+
+	if entry.ObjectETag != `"s3-object-etag"` {
+		t.Errorf("ObjectETag = %q, want %q", entry.ObjectETag, `"s3-object-etag"`)
+	}
+
+	if entry.Size != 1024 {
+		t.Errorf("Size = %d, want 1024", entry.Size)
+	}
+}
+
+// TestTouchIssuesConditionalCopy verifies the copy is a metadata self-copy
+// conditional on the Head-time object ETag, re-supplies ContentType (REPLACE
+// resets system metadata), and serializes headers through the allowlist.
+func TestTouchIssuesConditionalCopy(t *testing.T) {
+	fake := &fakeS3ObjectClient{}
+	cache := &s3HTTPCache{s3c: fake, bucket: "b", prefix: "cache"}
+	entry := &cachedEntry{ObjectETag: `"v1"`, Size: 1024}
+	headers := http.Header{
+		"Cache-Control":           []string{"max-age=86400"},
+		"Content-Type":            []string{"application/zip"},
+		"Content-Security-Policy": []string{"default-src 'none'"}, // not allowlisted
+	}
+
+	if err := cache.Touch(context.Background(), testKey, entry, headers); err != nil {
+		t.Fatalf("Touch() error: %v", err)
+	}
+
+	in := fake.copyInput
+	if in == nil {
+		t.Fatal("Touch issued no CopyObject")
+	}
+
+	if got, want := aws.ToString(in.Key), "cache/example.com/pkg.whl"; got != want {
+		t.Errorf("Key = %q, want %q", got, want)
+	}
+
+	if got, want := aws.ToString(in.CopySource), "b/cache/example.com/pkg.whl"; got != want {
+		t.Errorf("CopySource = %q, want %q", got, want)
+	}
+
+	if got := aws.ToString(in.CopySourceIfMatch); got != `"v1"` {
+		t.Errorf("CopySourceIfMatch = %q, want %q", got, `"v1"`)
+	}
+
+	if in.MetadataDirective != types.MetadataDirectiveReplace {
+		t.Errorf("MetadataDirective = %v, want REPLACE", in.MetadataDirective)
+	}
+
+	if got := aws.ToString(in.ContentType); got != "application/zip" {
+		t.Errorf("ContentType = %q, want %q", got, "application/zip")
+	}
+
+	if _, ok := in.Metadata["Cache-Control"]; !ok {
+		t.Errorf("Metadata missing Cache-Control: %v", in.Metadata)
+	}
+
+	if _, ok := in.Metadata["Content-Security-Policy"]; ok {
+		t.Errorf("Metadata carries non-allowlisted header: %v", in.Metadata)
+	}
+}
+
+// TestTouchSkipsOversizedObjects verifies rfc9111-freshness.AC5.5: entries
+// above the CopyObject single-part limit issue no copy attempt at all.
+func TestTouchSkipsOversizedObjects(t *testing.T) {
+	fake := &fakeS3ObjectClient{}
+	cache := &s3HTTPCache{s3c: fake, bucket: "b", prefix: "cache"}
+	entry := &cachedEntry{ObjectETag: `"v1"`, Size: copyObjectSizeLimit + 1}
+
+	if err := cache.Touch(context.Background(), testKey, entry, http.Header{}); err != nil {
+		t.Fatalf("Touch() error: %v", err)
+	}
+
+	if fake.copyCalls != 0 {
+		t.Errorf("Touch issued %d CopyObject calls for oversized object, want 0", fake.copyCalls)
+	}
+}
+
+var errPreconditionFailed = errors.New("PreconditionFailed")
+
+// TestTouchReturnsCopyErrors verifies a failed copy (e.g. the 412 from a
+// lost race) surfaces as an error for the caller's fail-open handling.
+func TestTouchReturnsCopyErrors(t *testing.T) {
+	fake := &fakeS3ObjectClient{copyErr: errPreconditionFailed}
+	cache := &s3HTTPCache{s3c: fake, bucket: "b", prefix: "cache"}
+	entry := &cachedEntry{ObjectETag: `"v1"`, Size: 1}
+
+	err := cache.Touch(context.Background(), testKey, entry, http.Header{})
+	if err == nil {
+		t.Fatal("Touch() = nil error, want the copy failure")
+	}
+}
+
+// TestTouchEscapesCopySource verifies keys containing query markers stay
+// inside the copy-source path instead of starting an S3 subresource query.
+func TestTouchEscapesCopySource(t *testing.T) {
+	fake := &fakeS3ObjectClient{}
+	cache := &s3HTTPCache{s3c: fake, bucket: "b", prefix: "cache"}
+	key := CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/dl", RawQuery: "json"}}
+
+	if err := cache.Touch(context.Background(), key, &cachedEntry{ObjectETag: `"v"`, Size: 1}, http.Header{}); err != nil {
+		t.Fatalf("Touch() error: %v", err)
+	}
+
+	if got := aws.ToString(fake.copyInput.CopySource); strings.Contains(got, "?") {
+		t.Errorf("CopySource %q contains unescaped '?'", got)
+	}
+}
+
+// TestTouchEncodesPlusInCopySource: S3 applies query-style decoding to
+// x-amz-copy-source, so a literal '+' reads as a space and the copy 404s.
+// PyPI local-version wheels (torch-2.1.0+cpu) put '+' in cache keys.
+func TestTouchEncodesPlusInCopySource(t *testing.T) {
+	fake := &fakeS3ObjectClient{}
+	cache := &s3HTTPCache{s3c: fake, bucket: "b", prefix: "cache"}
+	key := CacheKey{URL: &url.URL{Scheme: "https", Host: "files.pythonhosted.org", Path: "/torch-2.1.0+cpu.whl"}}
+
+	if err := cache.Touch(context.Background(), key, &cachedEntry{ObjectETag: `"v"`, Size: 1}, http.Header{}); err != nil {
+		t.Fatalf("Touch() error: %v", err)
+	}
+
+	got := aws.ToString(fake.copyInput.CopySource)
+	if strings.Contains(got, "+") {
+		t.Errorf("CopySource %q contains literal '+', want %%2B", got)
+	}
+
+	if want := "b/cache/files.pythonhosted.org/torch-2.1.0%2Bcpu.whl"; got != want {
+		t.Errorf("CopySource = %q, want %q", got, want)
 	}
 }
