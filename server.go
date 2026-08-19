@@ -298,7 +298,10 @@ func (m *cacheMiddleware) evaluateFreshness(entry *cachedEntry, keyHeaders []str
 
 // maybeTouch re-arms a revalidated entry's freshness window when doing so
 // would matter: the flag is on and the §4.3.4-merged headers pass the gate
-// at resident time zero. Anything else skips the write — advancing the clock of an
+// evaluated at now = storedAt — resident time zero (the validating
+// response's Age still counts against the declared lifetime), with
+// Expires-only lifetimes anchored at the touch instant.
+// Anything else skips the write — advancing the clock of an
 // entry that can never be fresh changes no future decision, and an
 // unconditional touch would cost one S3 write per request on exactly the
 // always-revalidating hosts. Touch failures (including the 412 from a lost

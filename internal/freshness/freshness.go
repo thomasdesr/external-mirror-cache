@@ -52,9 +52,10 @@ const (
 
 // Evaluate decides whether a cached entry is fresh at now: fresh iff its
 // Age-corrected current age is under the declared lifetime AND its resident
-// time (now − storedAt, where storedAt is the S3 LastModified this cache
-// stamps on every Put and Touch) is under lifetimeCap. The two axes are
-// independent — the cap bounds how long this cache goes between its own
+// time (now − storedAt) is under lifetimeCap. storedAt is when the entry
+// was — or, for a touch decision evaluated at now = storedAt, would be —
+// stored; it anchors both axes and the Expires fallback in
+// declaredLifetime. The two axes are independent — the cap bounds how long this cache goes between its own
 // upstream validations, so CDN residency reported in Age can shorten the
 // declared window but never consume the cap. keyHeaders are the header
 // names the entry's cache-key variant encodes (the Vary guard tolerates
@@ -88,7 +89,10 @@ func Evaluate(stored http.Header, storedAt, now time.Time, lifetimeCap time.Dura
 		return Decision{Reason: ReasonInvalidAge}
 	}
 
-	resident := now.Sub(storedAt)
+	// storedAt is S3's clock and now is ours; clamp so seconds of negative
+	// skew can neither stretch a freshness axis nor defeat the cap-zero
+	// kill switch (a clamped 0 still trips `resident >= 0`).
+	resident := max(now.Sub(storedAt), 0)
 	d := Decision{
 		Age:              resident + storedAge,
 		DeclaredLifetime: lifetime,

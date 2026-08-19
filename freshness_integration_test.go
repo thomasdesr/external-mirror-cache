@@ -374,8 +374,8 @@ func TestFreshness_CapBoundsDeclaredLifetime(t *testing.T) {
 // TestFreshness_VaryAcceptEncodingCanBeFresh is rfc9111-freshness.AC3.4:
 // Vary: Accept-Encoding — the near-universal CDN default, pypi.org's JSON
 // endpoints being the live example — does not block freshness on URL-only
-// keys, because the mirror never forwards the client's Accept-Encoding and
-// so holds exactly one encoding variant per key.
+// keys (rationale in varySatisfied; premise pinned by
+// TestIntegration_ClientAcceptEncodingNotForwarded).
 func TestFreshness_VaryAcceptEncodingCanBeFresh(t *testing.T) {
 	var upstreamHits atomic.Int32
 

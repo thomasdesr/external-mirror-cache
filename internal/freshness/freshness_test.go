@@ -246,10 +246,9 @@ func TestEvaluateVaryGuard(t *testing.T) {
 			wantReason: freshness.ReasonVaryMismatch,
 		},
 		{
-			// rfc9111-freshness.AC3.4: Vary: Accept-Encoding is always
-			// compatible — the mirror never forwards the client's
-			// Accept-Encoding, so the cache holds exactly one encoding
-			// variant per key (pypi.org Warehouse JSON shape).
+			// rfc9111-freshness.AC3.4: Accept-Encoding is exempt from the
+			// subset check (rationale in varySatisfied); pypi.org Warehouse
+			// JSON shape.
 			name:       "vary Accept-Encoding compatible on URL-only key",
 			stored:     h("Cache-Control", "max-age=900", "Vary", "Accept-Encoding"),
 			elapsed:    time.Minute,
@@ -373,6 +372,36 @@ func TestEvaluateFailOpen(t *testing.T) {
 			wantFresh:  false,
 			wantReason: freshness.ReasonNoLifetime,
 		},
+		{
+			// The kill switch: cap 0 means nothing is ever served fresh,
+			// even an entry stored this instant with a valid lifetime.
+			name:       "cap zero is never fresh",
+			stored:     h("Cache-Control", "max-age=900"),
+			elapsed:    0,
+			cap:        0,
+			wantFresh:  false,
+			wantReason: freshness.ReasonCapExpired,
+		},
+		{
+			// storedAt is S3's clock, now is ours; a small negative skew
+			// (negative elapsed) must not defeat the cap-zero kill switch.
+			name:       "clock skew behind storedAt cannot defeat cap zero",
+			stored:     h("Cache-Control", "max-age=900"),
+			elapsed:    -5 * time.Second,
+			cap:        0,
+			wantFresh:  false,
+			wantReason: freshness.ReasonCapExpired,
+		},
+		{
+			// Negative skew must not resurrect a negative lifetime: Expires
+			// an hour before storedAt is expired no matter whose clock lags.
+			name:       "clock skew cannot resurrect an expired Expires",
+			stored:     h("Date", storedAt.Format(http.TimeFormat), "Expires", storedAt.Add(-time.Hour).Format(http.TimeFormat)),
+			elapsed:    -2 * time.Hour,
+			cap:        7 * day,
+			wantFresh:  false,
+			wantReason: freshness.ReasonTTLExpired,
+		},
 	})
 }
 
@@ -455,12 +484,15 @@ func TestFreshnessMonotonic(t *testing.T) {
 }
 
 // Property: never fresh once resident time (now − storedAt) reaches the
-// cap, regardless of the declared lifetime or stored Age (cap dominance,
-// rfc9111-freshness.AC3.1's function half).
+// cap — cap zero included — regardless of the declared lifetime or stored
+// Age; and when the lifetime alone would allow freshness, the reason names
+// the cap (cap dominance, rfc9111-freshness.AC3.1's function half).
 func TestCapDominates(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
-		maxAge := rapid.Int64Range(0, 1<<40).Draw(t, "maxAge")
-		capSecs := rapid.Int64Range(1, 30*86400).Draw(t, "capSecs")
+		// 1<<32 stays inside parseDeltaSeconds' accepted range; a larger
+		// draw would read as no-declared-lifetime and dodge the cap check.
+		maxAge := rapid.Int64Range(0, 1<<32).Draw(t, "maxAge")
+		capSecs := rapid.Int64Range(0, 30*86400).Draw(t, "capSecs")
 		past := rapid.Int64Range(0, 30*86400).Draw(t, "past")
 		storedAge := rapid.Int64Range(0, 1<<20).Draw(t, "storedAge")
 
@@ -473,6 +505,11 @@ func TestCapDominates(t *testing.T) {
 		d := freshness.Evaluate(stored, storedAt, storedAt.Add(elapsed), time.Duration(capSecs)*time.Second, nil)
 		if d.Fresh {
 			t.Fatalf("fresh with elapsed %v >= cap %ds (max-age=%d, Age=%d)", elapsed, capSecs, maxAge, storedAge)
+		}
+
+		if age := elapsed + time.Duration(storedAge)*time.Second; age < time.Duration(maxAge)*time.Second &&
+			d.Reason != freshness.ReasonCapExpired {
+			t.Fatalf("lifetime allows age %v yet reason = %q, want cap expired", age, d.Reason)
 		}
 	})
 }

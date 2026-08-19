@@ -482,6 +482,47 @@ func TestIntegration_RangeRequestCachesFullFile(t *testing.T) {
 	}
 }
 
+// TestIntegration_ClientAcceptEncodingNotForwarded pins the premise the
+// freshness Vary guard's Accept-Encoding exemption stands on: the client's
+// Accept-Encoding never reaches upstream (the transport sends its own
+// uniform value), so the cache holds one encoding variant per key. If this
+// test starts failing, the exemption in varySatisfied is unsound.
+func TestIntegration_ClientAcceptEncodingNotForwarded(t *testing.T) {
+	var upstreamAcceptEncoding string
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamAcceptEncoding = r.Header.Get("Accept-Encoding")
+
+		w.Write([]byte("content"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+
+	proxy := newTestServer(upstream, cache)
+	defer proxy.Close()
+
+	client := &http.Client{
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, proxy.URL+upstreamHostPath(upstream, "/file.bin"), nil)
+	req.Header.Set("Accept-Encoding", "br;q=1.0, identity;q=0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+
+	resp.Body.Close()
+
+	if strings.Contains(upstreamAcceptEncoding, "br") {
+		t.Errorf("client Accept-Encoding forwarded to upstream: got %q", upstreamAcceptEncoding)
+	}
+}
+
 func TestIntegration_LastModifiedConditionalRequest(t *testing.T) {
 	var upstreamHits atomic.Int32
 
