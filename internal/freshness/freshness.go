@@ -189,12 +189,16 @@ func splitQuoted(s string) []string {
 
 // varySatisfied reports whether every header name in the stored Vary values
 // is one the cache-key variant encodes. Vary: * never matches (RFC 9111
-// §4.1); an absent or empty Vary always does.
+// §4.1); an absent or empty Vary always does. Accept-Encoding is always
+// compatible: the mirror never forwards the client's Accept-Encoding — the
+// upstream transport sends its own uniform value — so the cache holds
+// exactly one encoding variant per key and the axis cannot select a wrong
+// one.
 func varySatisfied(varyValues, keyHeaders []string) bool {
 	for _, value := range varyValues {
 		for name := range strings.SplitSeq(value, ",") {
 			name = strings.TrimSpace(name)
-			if name == "" {
+			if name == "" || strings.EqualFold(name, "Accept-Encoding") {
 				continue
 			}
 

@@ -238,12 +238,36 @@ func TestEvaluateVaryGuard(t *testing.T) {
 		},
 		{
 			name:       "vary naming unencoded header never fresh",
-			stored:     h("Cache-Control", "max-age=600", "Vary", "Accept, Accept-Encoding"),
+			stored:     h("Cache-Control", "max-age=600", "Vary", "Accept, Origin"),
 			elapsed:    0,
 			cap:        7 * day,
 			keyHeaders: []string{"Accept"},
 			wantFresh:  false,
 			wantReason: freshness.ReasonVaryMismatch,
+		},
+		{
+			// rfc9111-freshness.AC3.4: Vary: Accept-Encoding is always
+			// compatible — the mirror never forwards the client's
+			// Accept-Encoding, so the cache holds exactly one encoding
+			// variant per key (pypi.org Warehouse JSON shape).
+			name:       "vary Accept-Encoding compatible on URL-only key",
+			stored:     h("Cache-Control", "max-age=900", "Vary", "Accept-Encoding"),
+			elapsed:    time.Minute,
+			cap:        7 * day,
+			keyHeaders: nil,
+			wantFresh:  true,
+			wantReason: freshness.ReasonFresh,
+		},
+		{
+			// The exemption composes with encoded headers and is
+			// case-insensitive like every other Vary member.
+			name:       "vary accept-encoding tolerated alongside encoded Accept",
+			stored:     h("Cache-Control", "max-age=600", "Vary", "Accept, accept-encoding"),
+			elapsed:    time.Minute,
+			cap:        7 * day,
+			keyHeaders: []string{"Accept"},
+			wantFresh:  true,
+			wantReason: freshness.ReasonFresh,
 		},
 	})
 }

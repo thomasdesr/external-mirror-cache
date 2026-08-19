@@ -371,6 +371,40 @@ func TestFreshness_CapBoundsDeclaredLifetime(t *testing.T) {
 	}
 }
 
+// TestFreshness_VaryAcceptEncodingCanBeFresh is rfc9111-freshness.AC3.4:
+// Vary: Accept-Encoding — the near-universal CDN default, pypi.org's JSON
+// endpoints being the live example — does not block freshness on URL-only
+// keys, because the mirror never forwards the client's Accept-Encoding and
+// so holds exactly one encoding variant per key.
+func TestFreshness_VaryAcceptEncodingCanBeFresh(t *testing.T) {
+	var upstreamHits atomic.Int32
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Cache-Control", "max-age=900")
+		w.Header().Set("Vary", "Accept-Encoding")
+		w.Header().Set("ETag", testFreshETag)
+		w.Write([]byte(`{"info": {}}`))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServerWithFreshness(upstream, cache, 7*24*time.Hour)
+
+	defer proxy.Close()
+
+	client := noRedirectClient()
+	target := proxy.URL + upstreamHostPath(upstream, "/pypi/requests/json")
+
+	mustGet303(t, client, target) // miss: fetch + cache
+	mustGet303(t, client, target) // fresh: Vary Accept-Encoding is exempt
+	mustGet303(t, client, target)
+
+	if hits := upstreamHits.Load(); hits != 1 {
+		t.Errorf("upstream hits = %d, want 1 (Vary: Accept-Encoding must not block freshness)", hits)
+	}
+}
+
 // TestFreshness_CDNResidentAgeDoesNotDefeatCap is rfc9111-freshness.AC1.9:
 // CDN-fronted hosts hold hot immutable content for weeks, so every response
 // — first fetch and validating 304 alike — arrives with an Age far past the
