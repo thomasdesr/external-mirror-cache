@@ -71,7 +71,8 @@ var (
 	freshnessCapStr = flag.String(
 		"freshness-cap",
 		envDefault("MIRROR_CACHE_FRESHNESS_CAP", "168h"),
-		"global upper bound on any upstream-declared freshness lifetime;"+
+		"max time a fresh-eligible entry is served without revalidating,"+
+			" measured since our last store or successful revalidation;"+
 			" unlike the timeout flags, 0 does not disable the bound — it means"+
 			" nothing is ever served fresh (env: MIRROR_CACHE_FRESHNESS_CAP)",
 	)

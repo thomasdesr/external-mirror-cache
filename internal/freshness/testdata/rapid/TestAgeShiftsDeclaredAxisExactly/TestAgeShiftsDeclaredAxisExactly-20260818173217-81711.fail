@@ -1,0 +1,15 @@
+# 2026/08/18 17:32:17.166436 [TestAgeShiftsDeclaredAxisExactly] [rapid] draw maxAge: 2
+# 2026/08/18 17:32:17.166442 [TestAgeShiftsDeclaredAxisExactly] [rapid] draw k: 1
+# 2026/08/18 17:32:17.166443 [TestAgeShiftsDeclaredAxisExactly] [rapid] draw e: 0
+# 2026/08/18 17:32:17.166449 [TestAgeShiftsDeclaredAxisExactly] Age:1 tripped the cap with resident 0s under cap 1s
+#
+v0.4.8#17231458850310287617
+0x0
+0x28ba2e8ba2e8c
+0x2
+0x0
+0x0
+0x1
+0x0
+0x0
+0x0

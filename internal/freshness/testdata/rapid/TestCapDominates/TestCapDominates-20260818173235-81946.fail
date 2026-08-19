@@ -1,0 +1,19 @@
+# 2026/08/18 17:32:35.158853 [TestCapDominates] [rapid] draw maxAge: 2
+# 2026/08/18 17:32:35.158858 [TestCapDominates] [rapid] draw capSecs: 1
+# 2026/08/18 17:32:35.158859 [TestCapDominates] [rapid] draw past: 0
+# 2026/08/18 17:32:35.158861 [TestCapDominates] [rapid] draw storedAge: 0
+# 2026/08/18 17:32:35.158861 [TestCapDominates] fresh with elapsed 1s >= cap 1s (max-age=2, Age=0)
+#
+v0.4.8#5203841520712425782
+0x0
+0x2555555555556
+0x2
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0
+0x0

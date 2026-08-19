@@ -40,10 +40,11 @@ type cacheMiddleware struct {
 	uploadGroup singleflight.Group[string] // dedupes concurrent requests, returns presigned URL
 
 	// honorFreshness enables the RFC 9111 freshness gate: cached entries
-	// fresh under min(declared lifetime, freshnessCap) are served straight
-	// from the cache with no upstream request, and successful revalidations
-	// re-arm eligible entries via Touch. Off means byte-for-byte legacy
-	// behavior, new cache writes included.
+	// within their declared lifetime and resident for less than
+	// freshnessCap since our last validation are served straight from the
+	// cache with no upstream request, and successful revalidations re-arm
+	// eligible entries via Touch. Off means byte-for-byte legacy behavior,
+	// new cache writes included.
 	honorFreshness bool
 	freshnessCap   time.Duration
 }
@@ -128,7 +129,7 @@ func (m *cacheMiddleware) fetchAndCache(ctx context.Context, key CacheKey, accep
 				slog.String("action_reason", string(decision.Reason)),
 				slog.Duration("age", decision.Age),
 				slog.Duration("declared_lifetime", decision.DeclaredLifetime),
-				slog.Duration("effective_lifetime", decision.EffectiveLifetime),
+				slog.Duration("resident", decision.Resident),
 			)
 
 			return m.presign(ctx, key)
@@ -297,7 +298,7 @@ func (m *cacheMiddleware) evaluateFreshness(entry *cachedEntry, keyHeaders []str
 
 // maybeTouch re-arms a revalidated entry's freshness window when doing so
 // would matter: the flag is on and the §4.3.4-merged headers pass the gate
-// at age zero. Anything else skips the write — advancing the clock of an
+// at resident time zero. Anything else skips the write — advancing the clock of an
 // entry that can never be fresh changes no future decision, and an
 // unconditional touch would cost one S3 write per request on exactly the
 // always-revalidating hosts. Touch failures (including the 412 from a lost

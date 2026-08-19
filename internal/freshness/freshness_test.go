@@ -52,6 +52,29 @@ func TestEvaluateLifetimes(t *testing.T) {
 			wantReason: freshness.ReasonCapExpired,
 		},
 		{
+			// rfc9111-freshness.AC1.9: a CDN-fronted immutable file can carry
+			// weeks of CDN residency in its Age. The cap bounds resident time
+			// (our time since storing), not Age — an entry stored an hour ago
+			// is fresh no matter how long the CDN held it first.
+			name:       "pythonhosted CDN Age beyond cap still fresh when recently stored",
+			stored:     h("Cache-Control", "max-age=365000000, immutable, public", "Age", "1728000"),
+			elapsed:    time.Hour,
+			cap:        7 * day,
+			wantFresh:  true,
+			wantReason: freshness.ReasonFresh,
+		},
+		{
+			// When both axes have expired, the upstream's own declaration
+			// expiring is the primary fact; cap-expired is reserved for
+			// entries only our cap makes stale.
+			name:       "expired on both axes reports ttl expired",
+			stored:     h("Cache-Control", "max-age=900"),
+			elapsed:    8 * day,
+			cap:        7 * day,
+			wantFresh:  false,
+			wantReason: freshness.ReasonTTLExpired,
+		},
+		{
 			// rfc9111-freshness.AC1.2: cdn.azul.com via Fastly, s-maxage only,
 			// delivered pre-aged. Age: 11866 shortens the 86400s window.
 			name:       "azul s-maxage minus Age still fresh",
@@ -376,8 +399,8 @@ func TestEvaluateObservabilityFields(t *testing.T) {
 		t.Errorf("DeclaredLifetime = %v, want %v", d.DeclaredLifetime, want)
 	}
 
-	if want := 7 * day; d.EffectiveLifetime != want {
-		t.Errorf("EffectiveLifetime = %v, want %v", d.EffectiveLifetime, want)
+	if want := time.Hour; d.Resident != want {
+		t.Errorf("Resident = %v, want %v", d.Resident, want)
 	}
 }
 
@@ -407,56 +430,67 @@ func TestFreshnessMonotonic(t *testing.T) {
 	})
 }
 
-// Property: never fresh once elapsed reaches the cap, regardless of the
-// declared lifetime (cap dominance, rfc9111-freshness.AC3.1's function half).
+// Property: never fresh once resident time (now − storedAt) reaches the
+// cap, regardless of the declared lifetime or stored Age (cap dominance,
+// rfc9111-freshness.AC3.1's function half).
 func TestCapDominates(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		maxAge := rapid.Int64Range(0, 1<<40).Draw(t, "maxAge")
 		capSecs := rapid.Int64Range(1, 30*86400).Draw(t, "capSecs")
 		past := rapid.Int64Range(0, 30*86400).Draw(t, "past")
+		storedAge := rapid.Int64Range(0, 1<<20).Draw(t, "storedAge")
 
-		stored := h("Cache-Control", fmt.Sprintf("max-age=%d", maxAge))
+		stored := h(
+			"Cache-Control", fmt.Sprintf("max-age=%d", maxAge),
+			"Age", strconv.FormatInt(storedAge, 10),
+		)
 		elapsed := time.Duration(capSecs+past) * time.Second
 
 		d := freshness.Evaluate(stored, storedAt, storedAt.Add(elapsed), time.Duration(capSecs)*time.Second, nil)
 		if d.Fresh {
-			t.Fatalf("fresh with elapsed %v >= cap %ds (max-age=%d)", elapsed, capSecs, maxAge)
+			t.Fatalf("fresh with elapsed %v >= cap %ds (max-age=%d, Age=%d)", elapsed, capSecs, maxAge, storedAge)
 		}
 	})
 }
 
-// Property: a stored Age of k seconds shifts the entire decision by exactly
-// k — evaluating with Age: k at elapsed e equals evaluating without Age at
-// elapsed e+k (rfc9111-freshness.AC1.5).
-func TestAgeShiftsWindowExactly(t *testing.T) {
+// Property: a stored Age of k seconds shifts the declared-lifetime axis by
+// exactly k — with a never-binding cap, evaluating with Age: k at elapsed e
+// reaches the same verdict as evaluating without Age at elapsed e+k — and
+// leaves the resident axis untouched: no Age value can produce a cap expiry
+// while resident time is under the cap (rfc9111-freshness.AC1.5, AC1.9).
+func TestAgeShiftsDeclaredAxisExactly(t *testing.T) {
 	// k spans the full range parseDeltaSeconds accepts, so the property
 	// also proves the accepted range cannot overflow the age sum.
 	maxValidDelta := int64(math.MaxInt64) / int64(time.Second) / 2
 
 	rapid.Check(t, func(t *rapid.T) {
 		maxAge := rapid.Int64Range(0, 1<<32).Draw(t, "maxAge")
-		capSecs := rapid.Int64Range(1, 30*86400).Draw(t, "capSecs")
 		k := rapid.Int64Range(0, maxValidDelta).Draw(t, "k")
 		e := rapid.Int64Range(0, 40*86400).Draw(t, "e")
 
 		cc := fmt.Sprintf("max-age=%d", maxAge)
-		lifetimeCap := time.Duration(capSecs) * time.Second
+		aged := h("Cache-Control", cc, "Age", strconv.FormatInt(k, 10))
+		unbounded := time.Duration(math.MaxInt64)
 
-		withAge := freshness.Evaluate(
-			h("Cache-Control", cc, "Age", strconv.FormatInt(k, 10)),
-			storedAt, storedAt.Add(time.Duration(e)*time.Second), lifetimeCap, nil,
-		)
+		withAge := freshness.Evaluate(aged, storedAt, storedAt.Add(time.Duration(e)*time.Second), unbounded, nil)
 		shifted := freshness.Evaluate(
 			h("Cache-Control", cc),
-			storedAt, storedAt.Add(time.Duration(e+k)*time.Second), lifetimeCap, nil,
+			storedAt, storedAt.Add(time.Duration(e+k)*time.Second), unbounded, nil,
 		)
 
-		if withAge != shifted {
+		if withAge.Fresh != shifted.Fresh || withAge.Reason != shifted.Reason || withAge.Age != shifted.Age {
 			t.Fatalf("Age:%d at +%ds = %+v, no Age at +%ds = %+v", k, e, withAge, e+k, shifted)
 		}
 
 		if withAge.Age < 0 {
 			t.Fatalf("Age:%d at +%ds computed negative age %v (overflow)", k, e, withAge.Age)
+		}
+
+		capJustAboveElapsed := time.Duration(e)*time.Second + time.Second
+
+		d := freshness.Evaluate(aged, storedAt, storedAt.Add(time.Duration(e)*time.Second), capJustAboveElapsed, nil)
+		if d.Reason == freshness.ReasonCapExpired {
+			t.Fatalf("Age:%d tripped the cap with resident %ds under cap %v", k, e, capJustAboveElapsed)
 		}
 	})
 }

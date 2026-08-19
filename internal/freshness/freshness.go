@@ -28,8 +28,9 @@ type Decision struct {
 	// (s-maxage, else max-age, else Expires−Date). Zero when Reason is
 	// ReasonNoLifetime.
 	DeclaredLifetime time.Duration
-	// EffectiveLifetime is min(DeclaredLifetime, cap).
-	EffectiveLifetime time.Duration
+	// Resident is now − storedAt: how long since this cache last stored or
+	// revalidated the entry. The cap bounds Resident, not Age.
+	Resident time.Duration
 }
 
 // Reason explains a Decision, in the vocabulary the structured logs use.
@@ -49,10 +50,15 @@ const (
 	ReasonCapExpired   Reason = "cap expired"
 )
 
-// Evaluate decides whether a cached entry is fresh at now. storedAt is when
-// the entry was written (S3 LastModified); lifetimeCap globally bounds any
-// declared lifetime; keyHeaders are the header names the entry's cache-key
-// variant encodes (the Vary guard tolerates only those).
+// Evaluate decides whether a cached entry is fresh at now: fresh iff its
+// Age-corrected current age is under the declared lifetime AND its resident
+// time (now − storedAt, where storedAt is the S3 LastModified this cache
+// stamps on every Put and Touch) is under lifetimeCap. The two axes are
+// independent — the cap bounds how long this cache goes between its own
+// upstream validations, so CDN residency reported in Age can shorten the
+// declared window but never consume the cap. keyHeaders are the header
+// names the entry's cache-key variant encodes (the Vary guard tolerates
+// only those).
 func Evaluate(stored http.Header, storedAt, now time.Time, lifetimeCap time.Duration, keyHeaders []string) Decision {
 	if storedAt.IsZero() {
 		return Decision{Reason: ReasonNoStoredAt}
@@ -82,20 +88,21 @@ func Evaluate(stored http.Header, storedAt, now time.Time, lifetimeCap time.Dura
 		return Decision{Reason: ReasonInvalidAge}
 	}
 
+	resident := now.Sub(storedAt)
 	d := Decision{
-		Age:               now.Sub(storedAt) + storedAge,
-		DeclaredLifetime:  lifetime,
-		EffectiveLifetime: min(lifetime, lifetimeCap),
+		Age:              resident + storedAge,
+		DeclaredLifetime: lifetime,
+		Resident:         resident,
 	}
 
 	switch {
-	case d.Age < d.EffectiveLifetime: // §4.2: equality is stale
+	case d.Age >= lifetime: // §4.2: equality is stale
+		d.Reason = ReasonTTLExpired
+	case resident >= lifetimeCap:
+		d.Reason = ReasonCapExpired
+	default:
 		d.Fresh = true
 		d.Reason = ReasonFresh
-	case lifetime <= lifetimeCap:
-		d.Reason = ReasonTTLExpired
-	default:
-		d.Reason = ReasonCapExpired
 	}
 
 	return d

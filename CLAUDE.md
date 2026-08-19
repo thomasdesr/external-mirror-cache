@@ -58,7 +58,7 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 2. `reqlog.Middleware` assigns a request ID and structured logger to the context
 3. `keyFunc` builds a `CacheKey` from the target URL and request, and reports which header names the key's variant encodes (OCI paths with an Accept header encode Accept; everything else is URL-only)
 4. Server checks S3 for the cached entry (stored headers plus S3 LastModified, object ETag, and size) using the `CacheKey`
-5. With `--honor-freshness`: an entry that is fresh under RFC 9111 arithmetic -- min(declared lifetime, `--freshness-cap`), Age-corrected, no-cache and Vary guarded (`internal/freshness`) -- redirects straight to the S3 presigned URL with zero upstream traffic
+5. With `--honor-freshness`: an entry that is fresh under RFC 9111 arithmetic -- Age-corrected current age under the declared lifetime AND resident time (now minus stored-at) under `--freshness-cap`, no-cache and Vary guarded (`internal/freshness`) -- redirects straight to the S3 presigned URL with zero upstream traffic. The cap bounds time since our last validation, not CDN residency reported in `Age`
 6. Otherwise, if cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since` (and Accept header if present)
 7. On 304 Not Modified -- or a 200 whose strong ETag matches the cached one (some upstreams ignore conditional headers) -- redirects client to S3 presigned URL without re-uploading. With the flag on, if the §4.3.4-merged headers would make the entry fresh at age zero (and the response's ETag doesn't contradict the stored one), the entry is *touched*: a conditional S3 metadata self-copy that re-arms its freshness window without a body re-upload
 8. On any other 200 OK: streams response to S3 cache, then redirects client. A cache-write failure always errors -- S3 trouble is mirror infrastructure and must surface, never be masked by stale-serving
@@ -101,7 +101,7 @@ Upstream timeout flags:
 
 Freshness flags:
 - `--honor-freshness` / `MIRROR_CACHE_HONOR_FRESHNESS` (default `false`) -- serve fresh cache hits without revalidating; gates both the fresh fast path and the revalidation touch
-- `--freshness-cap` / `MIRROR_CACHE_FRESHNESS_CAP` (default `168h`) -- global upper bound on any upstream-declared freshness lifetime; `0` means nothing is ever served fresh (not "disable the bound")
+- `--freshness-cap` / `MIRROR_CACHE_FRESHNESS_CAP` (default `168h`) -- max resident time before a fresh-eligible entry revalidates; `0` means nothing is ever served fresh (not "disable the bound")
 
 ## Logging
 

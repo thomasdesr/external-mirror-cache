@@ -371,6 +371,61 @@ func TestFreshness_CapBoundsDeclaredLifetime(t *testing.T) {
 	}
 }
 
+// TestFreshness_CDNResidentAgeDoesNotDefeatCap is rfc9111-freshness.AC1.9:
+// CDN-fronted hosts hold hot immutable content for weeks, so every response
+// — first fetch and validating 304 alike — arrives with an Age far past the
+// cap. The cap bounds time since our own validation, not CDN residency: the
+// entry serves fresh right after storing, and a revalidation re-arms it.
+func TestFreshness_CDNResidentAgeDoesNotDefeatCap(t *testing.T) {
+	var upstreamHits atomic.Int32
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Age", "1728000") // 20 days of CDN residency, cap is 7
+
+		if r.Header.Get("If-None-Match") == testFreshETag {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		w.Header().Set("Cache-Control", "max-age=365000000, immutable")
+		w.Header().Set("ETag", testFreshETag)
+		w.Write([]byte("wheel bytes"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServerWithFreshness(upstream, cache, 7*24*time.Hour)
+
+	defer proxy.Close()
+
+	client := noRedirectClient()
+	target := proxy.URL + upstreamHostPath(upstream, "/pkg.whl")
+	cachedURL := cachedURLFor(upstream, "/pkg.whl")
+
+	mustGet303(t, client, target) // miss: stored carrying Age past the cap
+	mustGet303(t, client, target) // fresh: resident time is seconds
+
+	if hits := upstreamHits.Load(); hits != 1 {
+		t.Fatalf("upstream hits = %d, want 1 (CDN Age must not count against the cap)", hits)
+	}
+
+	ageEntry(t, cache, cachedURL, 8*24*time.Hour) // resident past the cap
+
+	mustGet303(t, client, target) // cap-expired: revalidates; aged 304 → touch
+
+	if calls := cache.touchCalls.Load(); calls != 1 {
+		t.Fatalf("touch calls = %d, want 1 (an aged 304 must still re-arm)", calls)
+	}
+
+	mustGet303(t, client, target) // fresh again under the re-armed window
+
+	if hits := upstreamHits.Load(); hits != 2 {
+		t.Errorf("upstream hits = %d, want 2 (re-armed entry must serve fresh)", hits)
+	}
+}
+
 // TestFreshness_OCIVariantKeysCanBeFresh is rfc9111-freshness.AC3.3: an OCI
 // Accept-variant entry with Vary: Accept can be fresh, and distinct Accept
 // variants are evaluated independently.
