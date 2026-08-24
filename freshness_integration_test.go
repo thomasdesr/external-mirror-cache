@@ -515,6 +515,66 @@ func TestFreshness_OCIVariantKeysCanBeFresh(t *testing.T) {
 	}
 }
 
+// TestFreshness_VaryAcceptVariantsServeFreshIndependently: every entry is
+// keyed by its Accept, so a negotiating non-OCI host (pypi.org/simple shape:
+// JSON or HTML by Accept, max-age=600, Vary: Accept) passes the Vary guard
+// and serves each variant fresh — one upstream fetch per variant, no flap,
+// no per-request revalidation.
+func TestFreshness_VaryAcceptVariantsServeFreshIndependently(t *testing.T) {
+	var upstreamHits atomic.Int32
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+		w.Header().Set("Cache-Control", "max-age=600")
+		w.Header().Set("Vary", "Accept")
+		w.Header().Set("Content-Type", r.Header.Get("Accept"))
+		w.Write([]byte("index for " + r.Header.Get("Accept")))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServerWithFreshness(upstream, cache, 7*24*time.Hour)
+
+	defer proxy.Close()
+
+	client := noRedirectClient()
+	target := proxy.URL + upstreamHostPath(upstream, "/simple/requests/")
+
+	get := func(accept string) {
+		t.Helper()
+
+		req, _ := http.NewRequest(http.MethodGet, target, nil)
+		req.Header.Set("Accept", accept)
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("GET (Accept %q): %v", accept, err)
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode != http.StatusSeeOther {
+			t.Fatalf("GET (Accept %q): status %d, want 303", accept, resp.StatusCode)
+		}
+	}
+
+	const jsonAccept = "application/vnd.pypi.simple.v1+json"
+
+	get(jsonAccept)  // miss for the JSON variant
+	get(jsonAccept)  // fresh: Vary Accept ⊆ {Accept}
+	get("text/html") // miss for the HTML variant: its own entry, no flap
+	get("text/html") // fresh
+	get(jsonAccept)  // still fresh: the HTML fetch did not clobber it
+
+	if hits := upstreamHits.Load(); hits != 2 {
+		t.Errorf("upstream hits = %d, want 2 (one fetch per variant, then fresh)", hits)
+	}
+
+	if calls := cache.putCalls.Load(); calls != 2 {
+		t.Errorf("put calls = %d, want 2 (variants must not overwrite each other)", calls)
+	}
+}
+
 // TestFreshness_MismatchedETagOn304SkipsTouch pins RFC 9111 §4.3.4's MUST
 // NOT: a 304 whose ETag doesn't strong-match the stored one (an IMS-only
 // revalidator answering for changed content) must not update the entry —

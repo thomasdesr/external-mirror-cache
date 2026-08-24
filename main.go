@@ -145,7 +145,7 @@ func run() error {
 			On5xx:             *staleOn5xx,
 			OnAnyError:        *staleOnAnyError,
 		},
-		keyFunc:        ociAwareKeyFunc,
+		keyFunc:        acceptVariantKeyFunc,
 		honorFreshness: honorFreshness,
 		freshnessCap:   freshnessCap,
 	}

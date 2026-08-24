@@ -367,16 +367,20 @@ func (m *cacheMiddleware) buildKey(target *url.URL, r *http.Request) (CacheKey, 
 	return CacheKey{URL: target}, nil
 }
 
-// ociAwareKeyFunc builds a CacheKey that includes the Accept header as the
-// variant for OCI paths (/v2/...), enabling per-format caching, and reports
-// Accept as the variant-encoded header when it does. Non-OCI paths — and OCI
-// requests that sent no Accept — produce an empty variant and an empty set,
-// preserving URL-only keying.
-func ociAwareKeyFunc(target *url.URL, r *http.Request) (CacheKey, []string) {
-	if _, _, ok := extractOCIRepository(target); ok {
-		if accept := acceptHeader(r); accept != "" {
-			return CacheKey{URL: target, Variant: accept}, []string{"Accept"}
-		}
+// acceptVariantKeyFunc builds a CacheKey whose variant is the request's
+// complete Accept set, for every path: the same URL with a different Accept
+// is a different entry and a different singleflight group. Keying on the
+// raw ask (not the response's Vary, which is unknowable before the fetch)
+// over-partitions but never serves one client's variant to another, keeps
+// each variant's validators self-consistent, and lets the freshness Vary
+// guard trust Vary: Accept entries — so it reports Accept as the
+// variant-encoded header. Requests without an Accept keep URL-only keys and
+// make no Accept-encoded claim: URL-only keys are where the pre-variant
+// corpus lives, and entries stored there by clients that did send Accepts
+// must not pass the Vary guard.
+func acceptVariantKeyFunc(target *url.URL, r *http.Request) (CacheKey, []string) {
+	if accept := acceptHeader(r); accept != "" {
+		return CacheKey{URL: target, Variant: accept}, []string{"Accept"}
 	}
 
 	return CacheKey{URL: target}, nil

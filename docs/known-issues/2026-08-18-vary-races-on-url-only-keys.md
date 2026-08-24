@@ -1,9 +1,23 @@
 # Vary races on URL-only cache keys
 
-Status: known issue, pre-existing (independent of the freshness gate,
-which only refuses to make it worse). Captured 2026-08-18 after watching
-a `/simple/` index page's stored object alternate between its JSON and
-HTML representations under mixed client Accepts.
+Status: hole 1 and the flap are fixed by Accept-variant cache keys on
+every path (docs/design-plans/2026-08-20-accept-variant-keys.md), which
+give negotiating URLs per-variant objects and per-variant singleflight
+groups. Hole 2 (the mutable-key redirect) is deliberately shelved: with
+variants keyed apart, the same-key overwrites that remain are
+byte-identical re-uploads (content-addressed registry paths whose
+upstreams provide no strong validator to match) and
+deliberately-rotating responses (auth tokens) — neither can hand a
+client wrong bytes — so a version-pinned-presign implementation was
+built, verified, and parked unmerged rather than pay for bucket
+versioning (which would also store a full-size version per touch and
+per byte-identical re-upload). Its trigger: client wrong-bytes reports,
+or a content class whose bytes genuinely change under one key. Hole 3
+(upstream `Vary`-blind conditional
+handling) remains accepted with no mechanism, per the trigger below.
+Originally captured 2026-08-18 after watching a `/simple/` index page's
+stored object alternate between its JSON and HTML representations under
+mixed client Accepts.
 
 ## Shape
 
