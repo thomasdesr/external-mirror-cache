@@ -1,6 +1,6 @@
 # Mirror Cache
 
-Last verified: 2026-08-17
+Last verified: 2026-08-24
 
 ## Scope & Boundaries
 
@@ -10,7 +10,7 @@ Mirror-cache is a **caching fetch proxy**: go upstream, get bytes, put them in S
 
 **Transport: protocol adapters.** Self-contained units that know how to fetch from a specific upstream type. The default is plain HTTP GET. OCI is the first non-trivial adapter. Each adapter owns its protocol flow end-to-end: discovery, handshakes, retry logic, and deciding when credentials are needed. Adapters present a uniform `http.RoundTripper` interface to the core.
 
-**Storage.** Cache keys, metadata serialization, presigned URLs, TTL/eviction. Cache keys are `CacheKey{URL, Variant}` pairs -- the core uses URL-only keys by default, but a pluggable `keyFunc` lets protocol adapters include request-derived data (e.g., Accept header) as a variant for correctness. Non-empty variants produce distinct S3 objects and distinct singleflight groups.
+**Storage.** Cache keys, metadata serialization, presigned URLs, TTL/eviction. Cache keys are `CacheKey{URL, Variant}` pairs -- the core keys every request by its complete Accept set as the variant (URL-only when no Accept is sent). Non-empty variants produce distinct S3 objects and distinct singleflight groups.
 
 **The litmus test:** "Does this serve getting bytes into S3?" If yes, in scope.
 
@@ -28,7 +28,7 @@ Mirror-cache is a **caching fetch proxy**: go upstream, get bytes, put them in S
 - Upstream requires a multi-step handshake to fetch (OCI token negotiation)
 - Credentials must be injected at a specific point in the protocol, not just on the top-level request
 - Caching correctness requires protocol knowledge (mutable metadata vs immutable artifacts, snapshot consistency)
-- The protocol has cache key requirements beyond the URL
+- The protocol has cache key requirements beyond the URL and Accept (the core already keys by both)
 
 **Use the default (plain HTTP) when:** upstream is a simple HTTPS GET, optionally with credential header injection via the shared Tokenizer client.
 
@@ -56,7 +56,7 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 **Request flow:**
 1. Client requests `/<domain>/<path>` (e.g., `/example.com/file.txt`)
 2. `reqlog.Middleware` assigns a request ID and structured logger to the context
-3. `keyFunc` builds a `CacheKey` from the target URL and request, and reports which header names the key's variant encodes (OCI paths with an Accept header encode Accept; everything else is URL-only)
+3. `acceptVariantKeyFunc` builds a `CacheKey` from the target URL and request, and reports which header names the key's variant encodes (any request with an Accept header keys by its complete Accept set; Accept-less requests are URL-only, design in `docs/design-plans/2026-08-20-accept-variant-keys.md`)
 4. Server checks S3 for the cached entry (stored headers plus S3 LastModified, object ETag, and size) using the `CacheKey`
 5. With `--honor-freshness`: an entry that is fresh under RFC 9111 arithmetic -- Age-corrected current age under the declared lifetime AND resident time (now minus stored-at) under `--freshness-cap`, no-cache and Vary guarded (`internal/freshness`) -- redirects straight to the S3 presigned URL with zero upstream traffic. The cap bounds time since our last validation, not CDN residency reported in `Age`
 6. Otherwise, if cached: sends conditional request to upstream with `If-None-Match`/`If-Modified-Since` (and Accept header if present)
@@ -66,9 +66,9 @@ HTTP caching proxy that stores upstream responses in S3 and serves cache hits vi
 Upstream redirects are followed before caching -- the cache key is the original requested URL (plus variant if applicable), not the final redirect destination.
 
 **Key components:**
-- `server.go` - Main HTTP handler (`cacheMiddleware`): parses `/<domain>/<path>` requests, builds a `CacheKey` via pluggable `keyFunc`, checks S3 cache, fetches upstream with singleflight dedup (keyed on `CacheKey.String()`), forwards Accept header to upstream, redirects clients to presigned S3 URLs. `ociAwareKeyFunc` includes Accept as the variant for `/v2/` OCI paths; non-OCI paths use URL-only keys
+- `server.go` - Main HTTP handler (`cacheMiddleware`): parses `/<domain>/<path>` requests, builds a `CacheKey` via `acceptVariantKeyFunc`, checks S3 cache, fetches upstream with singleflight dedup (keyed on `CacheKey.String()`), forwards Accept header to upstream, redirects clients to presigned S3 URLs. `acceptVariantKeyFunc` keys every request by its complete Accept set (URL-only when no Accept is sent)
 - `cache.go` - `CacheKey` type (URL + Variant), the `cachedEntry` record (headers, stored-at, object ETag, size), and the `httpCache` interface: `Head`, `Put`, `GetPresignedURL`, `Touch` (all take `CacheKey`)
-- `s3_cache.go` - S3 implementation of `httpCache`: stores responses, serves presigned URLs, and implements `Touch` as a CopyObject metadata self-copy -- conditional on the Head-time object ETag so a touch racing a concurrent `Put` loses with a 412, re-supplying ContentType (REPLACE resets system metadata), skipping objects over the 5GB single-part copy limit. S3 path is `<prefix>/<host>/<path>` for URL-only keys, with `//<variant>` appended for variant keys
+- `s3_cache.go` - S3 implementation of `httpCache`: stores responses, serves presigned URLs, and implements `Touch` as a CopyObject metadata self-copy -- conditional on the Head-time object ETag so a touch racing a concurrent `Put` loses with a 412, re-supplying ContentType (REPLACE resets system metadata), skipping objects over the 5GB single-part copy limit. S3 key grammar is `<prefix>/<escaped host><escaped path>[?<escaped query>][??<escaped variant>]`, stdlib-escaped so no component contains a raw `?` -- every `?` is a joiner, the grammar is injective, and the escaping is the identity on real traffic so keys read like the URLs they cache
 - `s3_metadata.go` - Serializes HTTP headers to/from S3 object metadata as JSON. Writes only an allowlisted subset (validators, entity headers, freshness fields) -- S3 caps user metadata at 2KB and full upstream header sets exceed it; reads stay permissive for the pre-allowlist corpus
 - `fallback.go` - `FallbackPolicy`: controls when stale cached content is served on upstream errors. Upstream only by design: cache-write (S3) failures never consult it
 - `http_caching.go` - Injects conditional request headers from cached headers

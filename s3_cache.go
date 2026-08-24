@@ -215,16 +215,34 @@ func (c *s3HTTPCache) Put(ctx context.Context, key CacheKey, headers http.Header
 	return nil
 }
 
+// s3PathFor maps a CacheKey to its S3 key:
+//
+//	prefix "/" PathEscape(host) EscapedPath ["?" QueryEscape(query)] ["??" PathEscape(variant)]
+//
+// The grammar is injective — two distinct (URL, variant) resources can
+// never share a key — because every encoder's output excludes a raw '?'
+// (pinned by TestKeyEncoderAlphabets), so every '?' byte in a finished key
+// is a joiner written here: "??" marks the variant, the first remaining
+// '?' marks the query. PathEscape's output also excludes '/', so the host
+// (and variant) cannot fake path structure, and EscapedPath is the
+// standard RFC 3986 path form — identity on real traffic, so keys read
+// exactly like the URLs they cache and the '/' hierarchy survives for
+// prefix listing. Without the escaping, a raw path could spell the
+// joiners itself: path "/a??gif" would collide with path "/a" + variant
+// "gif", and path "/a?b" with path "/a" + query "b" (paths arrive
+// decoded, so "%3F" produces a literal '?'). Assumes u.Path is empty or
+// starts with '/' — parseTargetURL always produces a leading slash — so
+// the host/path boundary cannot blur.
 func (c *s3HTTPCache) s3PathFor(key CacheKey) string {
 	u := key.URL
 
-	path := strings.Join([]string{c.prefix, u.Host, strings.TrimPrefix(u.Path, "/")}, "/")
+	path := c.prefix + "/" + url.PathEscape(u.Host) + u.EscapedPath()
 	if u.RawQuery != "" {
 		path += "?" + url.QueryEscape(u.RawQuery)
 	}
 
 	if key.Variant != "" {
-		path += "//" + url.PathEscape(key.Variant)
+		path += "??" + url.PathEscape(key.Variant)
 	}
 
 	return path

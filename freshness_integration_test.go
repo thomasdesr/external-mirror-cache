@@ -43,6 +43,29 @@ func mustGet303(t *testing.T, client *http.Client, url string) {
 	}
 }
 
+// mustGet303Accept is mustGet303 with an Accept header on the request.
+func mustGet303Accept(t *testing.T, client *http.Client, url, accept string) {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("GET %s (Accept %q): %v", url, accept, err)
+	}
+
+	req.Header.Set("Accept", accept)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s (Accept %q): %v", url, accept, err)
+	}
+
+	resp.Body.Close()
+
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("GET %s (Accept %q): status %d, want 303", url, accept, resp.StatusCode)
+	}
+}
+
 // cachedURLFor reconstructs the fakeCache key string for a proxied path.
 func cachedURLFor(upstream *httptest.Server, path string) string {
 	u, _ := url.Parse(upstream.URL)
@@ -460,18 +483,21 @@ func TestFreshness_CDNResidentAgeDoesNotDefeatCap(t *testing.T) {
 	}
 }
 
-// TestFreshness_OCIVariantKeysCanBeFresh is rfc9111-freshness.AC3.3: an OCI
-// Accept-variant entry with Vary: Accept can be fresh, and distinct Accept
-// variants are evaluated independently.
-func TestFreshness_OCIVariantKeysCanBeFresh(t *testing.T) {
+// TestFreshness_VaryAcceptVariantsServeFreshIndependently is
+// rfc9111-freshness.AC3.3, generalized: every entry is keyed by its Accept,
+// so a negotiating host (pypi.org/simple shape: JSON or HTML by Accept,
+// Vary: Accept) passes the Vary guard and serves each variant fresh — one
+// upstream fetch per variant, no flap, no per-request revalidation. OCI
+// manifest URLs are the same case: the keying is path-blind.
+func TestFreshness_VaryAcceptVariantsServeFreshIndependently(t *testing.T) {
 	var upstreamHits atomic.Int32
 
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
-		w.Header().Set("Cache-Control", "max-age=3600")
+		w.Header().Set("Cache-Control", "max-age=600")
 		w.Header().Set("Vary", "Accept")
 		w.Header().Set("Content-Type", r.Header.Get("Accept"))
-		w.Write([]byte("manifest for " + r.Header.Get("Accept")))
+		w.Write([]byte("index for " + r.Header.Get("Accept")))
 	}))
 	defer upstream.Close()
 
@@ -481,37 +507,75 @@ func TestFreshness_OCIVariantKeysCanBeFresh(t *testing.T) {
 	defer proxy.Close()
 
 	client := noRedirectClient()
-	target := proxy.URL + upstreamHostPath(upstream, "/v2/library/app/manifests/latest")
+	target := proxy.URL + upstreamHostPath(upstream, "/simple/requests/")
 
-	get := func(accept string) {
-		t.Helper()
+	const jsonAccept = "application/vnd.pypi.simple.v1+json"
 
-		req, _ := http.NewRequest(http.MethodGet, target, nil)
-		req.Header.Set("Accept", accept)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("GET: %v", err)
-		}
-
-		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusSeeOther {
-			t.Fatalf("status %d, want 303", resp.StatusCode)
-		}
-	}
-
-	get(ociImageIndexMediaType) // miss for this variant
-	get(ociImageIndexMediaType) // fresh: Vary Accept ⊆ {Accept}
-
-	if hits := upstreamHits.Load(); hits != 1 {
-		t.Fatalf("upstream hits = %d, want 1 (variant entry should be fresh)", hits)
-	}
-
-	get(ociImageManifestMediaType) // different variant: its own miss
+	mustGet303Accept(t, client, target, jsonAccept)  // miss for the JSON variant
+	mustGet303Accept(t, client, target, jsonAccept)  // fresh: Vary Accept ⊆ {Accept}
+	mustGet303Accept(t, client, target, "text/html") // miss for the HTML variant: its own entry, no flap
+	mustGet303Accept(t, client, target, "text/html") // fresh
+	mustGet303Accept(t, client, target, jsonAccept)  // still fresh: the HTML fetch did not clobber it
 
 	if hits := upstreamHits.Load(); hits != 2 {
-		t.Errorf("upstream hits = %d, want 2 (distinct variants evaluated independently)", hits)
+		t.Errorf("upstream hits = %d, want 2 (one fetch per variant, then fresh)", hits)
+	}
+
+	if calls := cache.putCalls.Load(); calls != 2 {
+		t.Errorf("put calls = %d, want 2 (variants must not overwrite each other)", calls)
+	}
+}
+
+// TestFreshness_VariantEntryTouchRearms: a variant-keyed entry that ages
+// past its window revalidates once, touches, and serves fresh again — the
+// revalidation path must carry the variant's Accept claim into the touch
+// gate, or every Vary: Accept entry silently decays to per-request
+// revalidation after its first window.
+func TestFreshness_VariantEntryTouchRearms(t *testing.T) {
+	var upstreamHits atomic.Int32
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		if r.Header.Get("If-None-Match") == testFreshETag {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		w.Header().Set("Cache-Control", "max-age=600")
+		w.Header().Set("Vary", "Accept")
+		w.Header().Set("ETag", testFreshETag)
+		w.Write([]byte("index"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServerWithFreshness(upstream, cache, 7*24*time.Hour)
+
+	defer proxy.Close()
+
+	client := noRedirectClient()
+	target := proxy.URL + upstreamHostPath(upstream, "/simple/requests/")
+
+	const jsonAccept = "application/vnd.pypi.simple.v1+json"
+
+	variantKey := cachedURLFor(upstream, "/simple/requests/") + "\x00" + jsonAccept
+
+	mustGet303Accept(t, client, target, jsonAccept) // miss: fetch + cache
+
+	ageEntry(t, cache, variantKey, time.Hour) // past max-age=600
+
+	mustGet303Accept(t, client, target, jsonAccept) // stale: revalidates, 304 → touch
+
+	if calls := cache.touchCalls.Load(); calls != 1 {
+		t.Fatalf("touch calls = %d, want 1 (variant revalidation must re-arm the window)", calls)
+	}
+
+	mustGet303Accept(t, client, target, jsonAccept) // fresh under the re-armed window
+
+	if hits := upstreamHits.Load(); hits != 2 {
+		t.Errorf("upstream hits = %d, want 2 (re-armed variant entry must serve fresh)", hits)
 	}
 }
 

@@ -95,7 +95,15 @@ var (
 )
 
 func (c *fakeCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, error) {
-	return "http://fake-s3/" + key.URL.Host + key.URL.Path, nil
+	// The variant must be visible in the URL so tests can catch the server
+	// presigning the wrong entry (e.g. dropping the variant on a fresh hit
+	// would redirect a JSON client to the URL-only object).
+	presigned := "http://fake-s3/" + key.URL.Host + key.URL.Path
+	if key.Variant != "" {
+		presigned += "?variant=" + url.QueryEscape(key.Variant)
+	}
+
+	return presigned, nil
 }
 
 func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, body io.Reader) error {
@@ -159,9 +167,8 @@ func newTestServerWith(upstream *httptest.Server, cache *fakeCache, configure fu
 	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
 
 	handler := &cacheMiddleware{
-		cache:   cache,
-		client:  upstreamClient,
-		keyFunc: ociAwareKeyFunc,
+		cache:  cache,
+		client: upstreamClient,
 	}
 
 	if configure != nil {
@@ -1663,7 +1670,6 @@ func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 		cache:    cache,
 		client:   upstreamClient,
 		fallback: FallbackPolicy{OnConnectionError: true},
-		keyFunc:  ociAwareKeyFunc,
 	}
 
 	proxy := httptest.NewServer(handler)
@@ -1710,57 +1716,55 @@ func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 	}
 }
 
-// Unit tests for ociAwareKeyFunc (AC2.1, AC2.2)
+// Unit tests for acceptVariantKeyFunc (AC2.1, AC2.2)
 
-func TestOCIAwareKeyFunc_OCI_IncludesAccept(t *testing.T) {
-	// AC2.1: OCI path with Accept header includes Accept in CacheKey.Variant
-	u, _ := url.Parse("https://gcr.io/v2/library/test/manifests/latest")
-	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
-	req.Header.Set("Accept", ociImageIndexMediaType)
+const acceptKeyHeader = "Accept"
 
-	key, keyHeaders := ociAwareKeyFunc(u, req)
-
-	if len(keyHeaders) != 1 || keyHeaders[0] != "Accept" {
-		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+func TestAcceptVariantKeyFunc_KeysAccept(t *testing.T) {
+	// AC2.1: the request's Accept becomes CacheKey.Variant, and Accept is
+	// reported as the variant-encoded header. The keying is path-blind, so
+	// an OCI manifest URL and a plain file URL are the same case.
+	testCases := []struct {
+		name   string
+		rawURL string
+		accept string
+	}{
+		{name: "OCI manifest media type", rawURL: "https://gcr.io/v2/library/test/manifests/latest", accept: ociImageIndexMediaType},
+		{name: "plain file", rawURL: "https://example.com/file.txt", accept: "text/html"},
 	}
 
-	if key.Variant != ociImageIndexMediaType {
-		t.Errorf("expected variant %q, got %q", ociImageIndexMediaType, key.Variant)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			u, _ := url.Parse(tc.rawURL)
+			req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+			req.Header.Set("Accept", tc.accept)
 
-	if key.URL != u {
-		t.Errorf("expected URL to be preserved")
-	}
-}
+			key, keyHeaders := acceptVariantKeyFunc(u, req)
 
-func TestOCIAwareKeyFunc_NonOCI_IgnoresAccept(t *testing.T) {
-	// AC2.2: Non-OCI path produces CacheKey with empty Variant regardless of Accept header
-	u, _ := url.Parse("https://example.com/file.txt")
-	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
-	req.Header.Set("Accept", dockerManifestV2MediaType)
+			if len(keyHeaders) != 1 || keyHeaders[0] != acceptKeyHeader {
+				t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+			}
 
-	key, keyHeaders := ociAwareKeyFunc(u, req)
+			if key.Variant != tc.accept {
+				t.Errorf("expected variant %q, got %q", tc.accept, key.Variant)
+			}
 
-	if len(keyHeaders) != 0 {
-		t.Errorf("expected no variant-encoded headers for non-OCI path, got %v", keyHeaders)
-	}
-
-	if key.Variant != "" {
-		t.Errorf("expected empty variant for non-OCI path, got %q", key.Variant)
-	}
-
-	if key.URL != u {
-		t.Errorf("expected URL to be preserved")
+			if key.URL != u {
+				t.Errorf("expected URL to be preserved")
+			}
+		})
 	}
 }
 
-func TestOCIAwareKeyFunc_OCI_NoAcceptHeader(t *testing.T) {
-	// Verify that OCI path with no Accept header produces empty variant
+func TestAcceptVariantKeyFunc_NoAcceptHeader(t *testing.T) {
+	// No Accept means a URL-only key and NO Accept-encoded claim: URL-only
+	// keys are where the pre-variant corpus lives, and entries stored there
+	// by clients that did send Accepts must not pass the Vary guard.
 	u, _ := url.Parse("https://gcr.io/v2/library/test/manifests/latest")
 	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
 	// No Accept header set
 
-	key, keyHeaders := ociAwareKeyFunc(u, req)
+	key, keyHeaders := acceptVariantKeyFunc(u, req)
 
 	if len(keyHeaders) != 0 {
 		t.Errorf("expected no variant-encoded headers when Accept absent, got %v", keyHeaders)
@@ -1846,7 +1850,15 @@ func TestIntegration_AcceptForwarding(t *testing.T) {
 	}
 }
 
-func TestOCIAwareKeyFunc_OCI_MultipleAcceptHeaders(t *testing.T) {
+func TestParseTargetURLRejectsEmptyHost(t *testing.T) {
+	// An empty host can never be dialed; rejecting it at parse time turns
+	// a guaranteed fetch failure into a clear 400.
+	if _, err := parseTargetURL("//file.txt", ""); err == nil {
+		t.Fatal("parseTargetURL(\"//file.txt\") should reject the empty host")
+	}
+}
+
+func TestAcceptVariantKeyFunc_MultipleAcceptHeaders(t *testing.T) {
 	// Clients (e.g. Bazel via Java's HttpURLConnection) send multiple Accept
 	// headers. The variant must reflect the complete set, not just the first.
 	u, _ := url.Parse("https://nvcr.io/v2/nvidia/k8s/dcgm-exporter/manifests/latest")
@@ -1854,9 +1866,9 @@ func TestOCIAwareKeyFunc_OCI_MultipleAcceptHeaders(t *testing.T) {
 	req.Header.Add("Accept", "text/html, image/gif, image/jpeg, */*")
 	req.Header.Add("Accept", ociImageManifestMediaType)
 
-	key, keyHeaders := ociAwareKeyFunc(u, req)
+	key, keyHeaders := acceptVariantKeyFunc(u, req)
 
-	if len(keyHeaders) != 1 || keyHeaders[0] != "Accept" {
+	if len(keyHeaders) != 1 || keyHeaders[0] != acceptKeyHeader {
 		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
 	}
 
@@ -2481,20 +2493,19 @@ func TestIntegration_OCIAccept_CacheRevalidationWithAcceptKey(t *testing.T) {
 	}
 }
 
-// TestIntegration_StructuredLoggingAttributes verifies that request and cache operations log expected structured attributes.
-func TestIntegration_NonOCI_AcceptIgnoredInCacheKey(t *testing.T) {
-	// AC4.4: Non-OCI requests with different Accept headers share the same cache entry
-	var upstreamHits atomic.Int32
+func TestIntegration_AcceptKeysDistinctEntries(t *testing.T) {
+	// Requests with different Accepts get their own entries: each is
+	// a first fetch (no cross-variant conditional), stored separately.
+	var (
+		upstreamHits    atomic.Int32
+		conditionalHits atomic.Int32
+	)
 
-	// Standard upstream server (no OCI auth)
 	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamHits.Add(1)
 
-		// Check for conditional request
-		if r.Header.Get("If-None-Match") == `"file-etag"` {
-			w.WriteHeader(http.StatusNotModified)
-
-			return
+		if r.Header.Get("If-None-Match") != "" {
+			conditionalHits.Add(1)
 		}
 
 		w.Header().Set("ETag", `"file-etag"`)
@@ -2516,44 +2527,26 @@ func TestIntegration_NonOCI_AcceptIgnoredInCacheKey(t *testing.T) {
 		},
 	}
 
-	// First request with Accept: text/html
-	req1, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
-	req1.Header.Set("Accept", "text/html")
+	mustGet303Accept(t, client, proxy.URL+proxyPath, "text/html")
+	mustGet303Accept(t, client, proxy.URL+proxyPath, "application/json")
 
-	resp1, err := client.Do(req1)
-	if err != nil {
-		t.Fatalf("first request failed: %v", err)
+	if hits := upstreamHits.Load(); hits != 2 {
+		t.Fatalf("expected 2 upstream hits (one per variant), got %d", hits)
 	}
 
-	resp1.Body.Close()
-
-	if resp1.StatusCode != http.StatusSeeOther {
-		t.Fatalf("first request: expected 303 redirect, got %d", resp1.StatusCode)
+	if cond := conditionalHits.Load(); cond != 0 {
+		t.Errorf("expected 0 conditional requests (each variant is its own first fetch), got %d", cond)
 	}
 
-	if upstreamHits.Load() != 1 {
-		t.Fatalf("after first request: expected 1 upstream hit, got %d", upstreamHits.Load())
+	if calls := cache.putCalls.Load(); calls != 2 {
+		t.Errorf("put calls = %d, want 2 (one entry per variant)", calls)
 	}
 
-	// Second request with different Accept: application/json (should use same cache entry)
-	req2, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
-	req2.Header.Set("Accept", "application/json")
-
-	resp2, err := client.Do(req2)
-	if err != nil {
-		t.Fatalf("second request failed: %v", err)
-	}
-
-	resp2.Body.Close()
-
-	if resp2.StatusCode != http.StatusSeeOther {
-		t.Fatalf("second request: expected 303 redirect, got %d", resp2.StatusCode)
-	}
-
-	// Verify upstream was hit twice total (initial fetch + conditional revalidation)
-	// NOT three times, which would happen if Accept caused a separate cache entry
-	if upstreamHits.Load() != 2 {
-		t.Fatalf("expected 2 upstream hits (same cache entry), got %d", upstreamHits.Load())
+	base := cachedURLFor(upstream, "/file.txt")
+	for _, accept := range []string{"text/html", "application/json"} {
+		if cache.get(base+"\x00"+accept) == nil {
+			t.Errorf("no cache entry stored for variant %q", accept)
+		}
 	}
 }
 

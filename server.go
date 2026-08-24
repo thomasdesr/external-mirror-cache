@@ -36,7 +36,6 @@ type cacheMiddleware struct {
 	cache       httpCache
 	client      *http.Client
 	fallback    FallbackPolicy
-	keyFunc     func(target *url.URL, r *http.Request) (CacheKey, []string)
 	uploadGroup singleflight.Group[string] // dedupes concurrent requests, returns presigned URL
 
 	// honorFreshness enables the RFC 9111 freshness gate: cached entries
@@ -70,7 +69,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accept := acceptHeader(r)
-	key, keyHeaders := m.buildKey(target, r)
+	key, keyHeaders := acceptVariantKeyFunc(target, r)
 
 	// Singleflight ensures only one request fetches from upstream.
 	// All callers (including leader) redirect to the cached content.
@@ -357,26 +356,20 @@ func (m *cacheMiddleware) presign(ctx context.Context, key CacheKey) (string, er
 	return u, nil
 }
 
-// buildKey returns the cache key plus the header names its variant encodes
-// (the freshness gate's Vary guard tolerates only those).
-func (m *cacheMiddleware) buildKey(target *url.URL, r *http.Request) (CacheKey, []string) {
-	if m.keyFunc != nil {
-		return m.keyFunc(target, r)
-	}
-
-	return CacheKey{URL: target}, nil
-}
-
-// ociAwareKeyFunc builds a CacheKey that includes the Accept header as the
-// variant for OCI paths (/v2/...), enabling per-format caching, and reports
-// Accept as the variant-encoded header when it does. Non-OCI paths — and OCI
-// requests that sent no Accept — produce an empty variant and an empty set,
-// preserving URL-only keying.
-func ociAwareKeyFunc(target *url.URL, r *http.Request) (CacheKey, []string) {
-	if _, _, ok := extractOCIRepository(target); ok {
-		if accept := acceptHeader(r); accept != "" {
-			return CacheKey{URL: target, Variant: accept}, []string{"Accept"}
-		}
+// acceptVariantKeyFunc builds a CacheKey whose variant is the request's
+// complete Accept set, for every path: the same URL with a different Accept
+// is a different entry and a different singleflight group. Keying on the
+// raw ask (not the response's Vary, which is unknowable before the fetch)
+// over-partitions but never serves one client's variant to another, keeps
+// each variant's validators self-consistent, and lets the freshness Vary
+// guard trust Vary: Accept entries — so it reports Accept as the
+// variant-encoded header. Requests without an Accept keep URL-only keys and
+// make no Accept-encoded claim: URL-only keys are where the pre-variant
+// corpus lives, and entries stored there by clients that did send Accepts
+// must not pass the Vary guard.
+func acceptVariantKeyFunc(target *url.URL, r *http.Request) (CacheKey, []string) {
+	if accept := acceptHeader(r); accept != "" {
+		return CacheKey{URL: target, Variant: accept}, []string{"Accept"}
 	}
 
 	return CacheKey{URL: target}, nil
@@ -400,7 +393,9 @@ func parseTargetURL(path, rawQuery string) (*url.URL, error) {
 	path = strings.TrimPrefix(path, "/")
 	parts := strings.SplitN(path, "/", 2)
 
-	if len(parts) != 2 {
+	// An empty host can never be dialed; reject it here so the request
+	// fails with a clear 400 instead of a downstream fetch error.
+	if len(parts) != 2 || parts[0] == "" {
 		return nil, errorutil.Wrapf(errInvalidPath, "invalid path %q", path)
 	}
 
