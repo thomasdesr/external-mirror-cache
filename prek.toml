@@ -34,7 +34,7 @@ priority = 100
 
 [[repos]]
 repo = "https://github.com/golangci/golangci-lint"
-rev = "v2.9.0"
+rev = "v2.12.2"
 
 [[repos.hooks]]
 id = "golangci-lint"
@@ -50,5 +50,5 @@ priority = 100
 
 [[repos]]
 repo = "https://github.com/zizmorcore/zizmor-pre-commit"
-rev = "v1.22.0"
+rev = "v1.29.0"
 hooks = [{ id = "zizmor", args = ["--pedantic"] }]
