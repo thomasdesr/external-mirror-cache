@@ -1714,47 +1714,39 @@ func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 
 const acceptKeyHeader = "Accept"
 
-func TestAcceptVariantKeyFunc_OCI_IncludesAccept(t *testing.T) {
-	// AC2.1: OCI path with Accept header includes Accept in CacheKey.Variant
-	u, _ := url.Parse("https://gcr.io/v2/library/test/manifests/latest")
-	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
-	req.Header.Set("Accept", ociImageIndexMediaType)
-
-	key, keyHeaders := acceptVariantKeyFunc(u, req)
-
-	if len(keyHeaders) != 1 || keyHeaders[0] != acceptKeyHeader {
-		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+func TestAcceptVariantKeyFunc_KeysAccept(t *testing.T) {
+	// AC2.1: the request's Accept becomes CacheKey.Variant, and Accept is
+	// reported as the variant-encoded header. The keying is path-blind, so
+	// an OCI manifest URL and a plain file URL are the same case.
+	testCases := []struct {
+		name   string
+		rawURL string
+		accept string
+	}{
+		{name: "OCI manifest media type", rawURL: "https://gcr.io/v2/library/test/manifests/latest", accept: ociImageIndexMediaType},
+		{name: "plain file", rawURL: "https://example.com/file.txt", accept: "text/html"},
 	}
 
-	if key.Variant != ociImageIndexMediaType {
-		t.Errorf("expected variant %q, got %q", ociImageIndexMediaType, key.Variant)
-	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			u, _ := url.Parse(tc.rawURL)
+			req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
+			req.Header.Set("Accept", tc.accept)
 
-	if key.URL != u {
-		t.Errorf("expected URL to be preserved")
-	}
-}
+			key, keyHeaders := acceptVariantKeyFunc(u, req)
 
-func TestAcceptVariantKeyFunc_NonOCI_KeysAccept(t *testing.T) {
-	// Every path keys by Accept, not just /v2/: same URL with a different
-	// Accept is a different entry, which is what lets the Vary guard trust
-	// Vary: Accept everywhere.
-	u, _ := url.Parse("https://example.com/file.txt")
-	req, _ := http.NewRequest(http.MethodGet, "http://proxy/dummy", nil)
-	req.Header.Set("Accept", "text/html")
+			if len(keyHeaders) != 1 || keyHeaders[0] != acceptKeyHeader {
+				t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
+			}
 
-	key, keyHeaders := acceptVariantKeyFunc(u, req)
+			if key.Variant != tc.accept {
+				t.Errorf("expected variant %q, got %q", tc.accept, key.Variant)
+			}
 
-	if len(keyHeaders) != 1 || keyHeaders[0] != acceptKeyHeader {
-		t.Errorf("expected variant-encoded headers [Accept], got %v", keyHeaders)
-	}
-
-	if key.Variant != "text/html" {
-		t.Errorf("expected variant %q, got %q", "text/html", key.Variant)
-	}
-
-	if key.URL != u {
-		t.Errorf("expected URL to be preserved")
+			if key.URL != u {
+				t.Errorf("expected URL to be preserved")
+			}
+		})
 	}
 }
 
@@ -1849,6 +1841,14 @@ func TestIntegration_AcceptForwarding(t *testing.T) {
 				t.Errorf("expected upstream Accept %q, got %q", tt.expectedAccept, receivedAccept)
 			}
 		})
+	}
+}
+
+func TestParseTargetURLRejectsEmptyHost(t *testing.T) {
+	// An empty host can never be dialed; rejecting it at parse time turns
+	// a guaranteed fetch failure into a clear 400.
+	if _, err := parseTargetURL("//file.txt", ""); err == nil {
+		t.Fatal("parseTargetURL(\"//file.txt\") should reject the empty host")
 	}
 }
 
@@ -2487,8 +2487,8 @@ func TestIntegration_OCIAccept_CacheRevalidationWithAcceptKey(t *testing.T) {
 	}
 }
 
-func TestIntegration_NonOCI_AcceptKeysDistinctEntries(t *testing.T) {
-	// Non-OCI requests with different Accepts get their own entries: each is
+func TestIntegration_AcceptKeysDistinctEntries(t *testing.T) {
+	// Requests with different Accepts get their own entries: each is
 	// a first fetch (no cross-variant conditional), stored separately.
 	var (
 		upstreamHits    atomic.Int32
@@ -2521,26 +2521,8 @@ func TestIntegration_NonOCI_AcceptKeysDistinctEntries(t *testing.T) {
 		},
 	}
 
-	get := func(accept string) {
-		t.Helper()
-
-		req, _ := http.NewRequest(http.MethodGet, proxy.URL+proxyPath, nil)
-		req.Header.Set("Accept", accept)
-
-		resp, err := client.Do(req)
-		if err != nil {
-			t.Fatalf("request (Accept %q) failed: %v", accept, err)
-		}
-
-		resp.Body.Close()
-
-		if resp.StatusCode != http.StatusSeeOther {
-			t.Fatalf("request (Accept %q): expected 303 redirect, got %d", accept, resp.StatusCode)
-		}
-	}
-
-	get("text/html")
-	get("application/json")
+	mustGet303Accept(t, client, proxy.URL+proxyPath, "text/html")
+	mustGet303Accept(t, client, proxy.URL+proxyPath, "application/json")
 
 	if hits := upstreamHits.Load(); hits != 2 {
 		t.Fatalf("expected 2 upstream hits (one per variant), got %d", hits)

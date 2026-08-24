@@ -199,6 +199,99 @@ func TestS3PathForIncludesQuery(t *testing.T) {
 	}
 }
 
+// TestS3PathForDistinctResourcesGetDistinctKeys pins the key grammar's
+// injectivity on concrete collision pairs: each pair is two distinct
+// logical resources that previously shared one S3 key, where whichever
+// wrote last owned the object and served its bytes for both.
+func TestS3PathForDistinctResourcesGetDistinctKeys(t *testing.T) {
+	cache := &s3HTTPCache{bucket: "test-bucket", prefix: "cache"}
+
+	testCases := []struct {
+		name string
+		a, b CacheKey
+	}{
+		{
+			name: "path embedding the variant separator vs a variant",
+			a:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a//gif"}},
+			b:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a"}, Variant: "gif"},
+		},
+		{
+			name: "path embedding a percent-encoded variant vs a variant",
+			a:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a//text%2Fhtml"}},
+			b:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a"}, Variant: "text/html"},
+		},
+		{
+			name: "literal question mark in path vs a query",
+			a:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a?b"}},
+			b:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a", RawQuery: "b"}},
+		},
+		{
+			name: "path embedding query-plus-variant spelling vs query and variant",
+			a:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a?b??gif"}},
+			b:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a", RawQuery: "b"}, Variant: "gif"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			keyA := cache.s3PathFor(tc.a)
+			keyB := cache.s3PathFor(tc.b)
+
+			if keyA == keyB {
+				t.Fatalf("distinct resources share S3 key %q", keyA)
+			}
+		})
+	}
+}
+
+// TestKeyEncoderAlphabets pins the stdlib facts the grammar's injectivity
+// argument leans on: no encoder's output contains a raw '?' (so every '?'
+// in a finished key is a joiner s3PathFor wrote), and PathEscape's output
+// contains no '/' (so the host/variant components cannot fake structure).
+func TestKeyEncoderAlphabets(t *testing.T) {
+	for b := range 256 {
+		s := string([]byte{byte(b)})
+
+		if got := url.PathEscape(s); strings.ContainsAny(got, "?/") {
+			t.Errorf("PathEscape(%q) = %q contains a joiner byte", s, got)
+		}
+
+		if got := url.QueryEscape(s); strings.ContainsAny(got, "?/") {
+			t.Errorf("QueryEscape(%q) = %q contains a joiner byte", s, got)
+		}
+
+		u := &url.URL{Path: "/x" + s}
+		if got := u.EscapedPath(); strings.Contains(got, "?") {
+			t.Errorf("EscapedPath of path with byte %#x = %q contains raw '?'", b, got)
+		}
+	}
+}
+
+// Property: no URL-only key can equal any variant key, for any hosts,
+// paths, and any non-empty variant.
+func TestS3PathForVariantNamespaceDisjoint(t *testing.T) {
+	cache := &s3HTTPCache{bucket: "test-bucket", prefix: "cache"}
+
+	rapid.Check(t, func(t *rapid.T) {
+		hostA := rapid.StringMatching(`[a-z][a-z0-9.-]{0,20}`).Draw(t, "hostA")
+		hostB := rapid.StringMatching(`[a-z][a-z0-9.-]{0,20}`).Draw(t, "hostB")
+		pathA := "/" + rapid.String().Draw(t, "pathA")
+		pathB := "/" + rapid.String().Draw(t, "pathB")
+		variant := rapid.StringN(1, 100, 100).Draw(t, "variant")
+
+		urlOnly := cache.s3PathFor(CacheKey{URL: &url.URL{Scheme: "https", Host: hostA, Path: pathA}})
+		withVariant := cache.s3PathFor(CacheKey{
+			URL:     &url.URL{Scheme: "https", Host: hostB, Path: pathB},
+			Variant: variant,
+		})
+
+		if urlOnly == withVariant {
+			t.Fatalf("URL-only key %q collides with variant key (hostA=%q pathA=%q hostB=%q pathB=%q variant=%q)",
+				urlOnly, hostA, pathA, hostB, pathB, variant)
+		}
+	})
+}
+
 func TestParseTargetURLIsPure(t *testing.T) {
 	rapid.Check(t, func(t *rapid.T) {
 		host := rapid.StringMatching(`[a-z][a-z0-9.-]*`).Draw(t, "host")
@@ -327,7 +420,7 @@ func TestS3PathForEmptyVariantBackwardCompat(t *testing.T) {
 }
 
 // TestS3PathForVariantAppendedWithSeparator verifies AC1.2: non-empty variant
-// appends // + URL-escaped variant to the S3 path.
+// appends "??" + URL-escaped variant to the S3 path.
 func TestS3PathForVariantAppendedWithSeparator(t *testing.T) {
 	cache := &s3HTTPCache{
 		bucket: "test-bucket",
@@ -339,9 +432,9 @@ func TestS3PathForVariantAppendedWithSeparator(t *testing.T) {
 		variant        string
 		expectedSuffix string
 	}{
-		{"simple media type", "text/plain", "//text%2Fplain"},
-		{"oci image index", "application/vnd.oci.image.index.v1+json", "//application%2Fvnd.oci.image.index.v1+json"},
-		{"comma and space", "a, b", "//a%2C%20b"},
+		{"simple media type", "text/plain", "??text%2Fplain"},
+		{"oci image index", "application/vnd.oci.image.index.v1+json", "??application%2Fvnd.oci.image.index.v1+json"},
+		{"comma and space", "a, b", "??a%2C%20b"},
 	}
 
 	for _, tc := range testCases {
@@ -378,22 +471,22 @@ func TestS3PathForSpecialCharactersEscaped(t *testing.T) {
 		{
 			"forward slash escaped",
 			"application/json",
-			"//application%2Fjson",
+			"??application%2Fjson",
 		},
 		{
 			"plus not escaped (reserved char)",
 			"application/vnd.oci+json",
-			"//application%2Fvnd.oci+json",
+			"??application%2Fvnd.oci+json",
 		},
 		{
 			"colon not escaped (reserved char)",
 			"text:plain",
-			"//text:plain",
+			"??text:plain",
 		},
 		{
 			"space escaped",
 			"accept header",
-			"//accept%20header",
+			"??accept%20header",
 		},
 	}
 

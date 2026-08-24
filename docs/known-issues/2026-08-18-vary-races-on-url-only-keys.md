@@ -8,11 +8,12 @@ variants keyed apart, the same-key overwrites that remain are
 byte-identical re-uploads (content-addressed registry paths whose
 upstreams provide no strong validator to match) and
 deliberately-rotating responses (auth tokens) — neither can hand a
-client wrong bytes — so a version-pinned-presign implementation was
-built, verified, and parked unmerged rather than pay for bucket
-versioning (which would also store a full-size version per touch and
-per byte-identical re-upload). Its trigger: client wrong-bytes reports,
-or a content class whose bytes genuinely change under one key. Hole 3
+client wrong bytes — so version-pinned presigned URLs (the first fix
+direction below, validated in a prototype) are deliberately not in the
+tree rather than pay for bucket versioning, which would also store a
+full-size version per touch and per byte-identical re-upload. Its
+trigger: client wrong-bytes reports, or a content class whose bytes
+genuinely change under one key. Hole 3
 (upstream `Vary`-blind conditional
 handling) remains accepted with no mechanism, per the trigger below.
 Originally captured 2026-08-18 after watching a `/simple/` index page's

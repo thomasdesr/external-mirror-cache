@@ -46,10 +46,31 @@ Key by the raw Accept string, on every path.
   bytes.
 - **No hashing.** A hash is a different spelling of the same partition; it
   merges nothing raw strings would split. Raw keeps the S3 key readable.
+  A pathological multi-kilobyte Accept would push the key past S3's
+  length cap and fail loudly on every attempt for that request shape;
+  no real client tooling sends one, so no bound is built — hashing
+  oversized variants is the fix if such a client ever appears.
 - **Accept-less requests keep URL-only keys and make no Accept-encoded
   claim.** URL-only keys are where the pre-variant corpus lives; entries
   stored there by clients that did send Accepts must not pass the
-  freshness Vary guard.
+  freshness Vary guard. Accepted cost: an Accept-less client on a
+  `Vary: Accept` host revalidates on every request, forever — correct,
+  just never fast; no known client omits Accept.
+- **The S3 key grammar is injective, via stdlib encoders only.** A key
+  is `prefix "/" PathEscape(host) EscapedPath ["?" QueryEscape(query)]
+  ["??" PathEscape(variant)]`. Every encoder's output excludes a raw
+  `?`, so every `?` in a finished key is a structural joiner: `??`
+  marks the variant, the first remaining `?` marks the query. Without
+  this, raw request paths could spell the joiners themselves: a path
+  ending `//<token>` shared an object with the bare path plus
+  `Accept: token`, and a path containing a literal `?` (paths arrive
+  decoded, so `%3F` produces one) shared an object with the same path
+  split at the `?` into path-plus-query — two distinct resources on one
+  key, whichever wrote last serving its bytes for both. The encoders
+  are the identity on real hostnames and real paths, so keys stay
+  byte-identical to the corpus, read exactly like the URLs they cache,
+  and keep the `/` hierarchy for prefix listing; a URL's variant
+  objects sort beside their URL-only twin.
 
 ## Consequences
 

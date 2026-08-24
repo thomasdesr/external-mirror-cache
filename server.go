@@ -404,7 +404,9 @@ func parseTargetURL(path, rawQuery string) (*url.URL, error) {
 	path = strings.TrimPrefix(path, "/")
 	parts := strings.SplitN(path, "/", 2)
 
-	if len(parts) != 2 {
+	// An empty host can never be dialed; reject it here so the request
+	// fails with a clear 400 instead of a downstream fetch error.
+	if len(parts) != 2 || parts[0] == "" {
 		return nil, errorutil.Wrapf(errInvalidPath, "invalid path %q", path)
 	}
 
