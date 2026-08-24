@@ -95,7 +95,15 @@ var (
 )
 
 func (c *fakeCache) GetPresignedURL(ctx context.Context, key CacheKey) (string, error) {
-	return "http://fake-s3/" + key.URL.Host + key.URL.Path, nil
+	// The variant must be visible in the URL so tests can catch the server
+	// presigning the wrong entry (e.g. dropping the variant on a fresh hit
+	// would redirect a JSON client to the URL-only object).
+	presigned := "http://fake-s3/" + key.URL.Host + key.URL.Path
+	if key.Variant != "" {
+		presigned += "?variant=" + url.QueryEscape(key.Variant)
+	}
+
+	return presigned, nil
 }
 
 func (c *fakeCache) Put(ctx context.Context, key CacheKey, headers http.Header, body io.Reader) error {
@@ -159,9 +167,8 @@ func newTestServerWith(upstream *httptest.Server, cache *fakeCache, configure fu
 	upstreamClient.Transport = newOCIAuthTransport(upstreamClient.Transport)
 
 	handler := &cacheMiddleware{
-		cache:   cache,
-		client:  upstreamClient,
-		keyFunc: acceptVariantKeyFunc,
+		cache:  cache,
+		client: upstreamClient,
 	}
 
 	if configure != nil {
@@ -1663,7 +1670,6 @@ func TestIntegration_StaleFallbackOnHungUpstream_WithCache(t *testing.T) {
 		cache:    cache,
 		client:   upstreamClient,
 		fallback: FallbackPolicy{OnConnectionError: true},
-		keyFunc:  acceptVariantKeyFunc,
 	}
 
 	proxy := httptest.NewServer(handler)

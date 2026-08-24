@@ -71,7 +71,12 @@ func genURL() *rapid.Generator[*url.URL] {
 	return rapid.Custom(func(t *rapid.T) *url.URL {
 		scheme := rapid.SampledFrom([]string{"http", "https"}).Draw(t, "scheme")
 		host := rapid.StringMatching(`[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)*`).Draw(t, "host")
-		path := "/" + rapid.StringMatching(`[a-zA-Z0-9/_.-]*`).Draw(t, "path")
+		// The path alphabet includes every reserved byte the encoders leave
+		// literal ('+', ':', '@', '~', '=', '&', '$', ',', ';') — live keys
+		// contain them (e.g. wheels with '+' in the filename), so encoder
+		// drift that starts escaping one must fail a test, not silently
+		// re-key that corpus slice.
+		path := "/" + rapid.StringMatching(`[a-zA-Z0-9/_.+:@~=&$,;-]*`).Draw(t, "path")
 		query := rapid.StringMatching(`[a-zA-Z0-9=&_.-]*`).Draw(t, "query")
 
 		return &url.URL{
@@ -79,6 +84,28 @@ func genURL() *rapid.Generator[*url.URL] {
 			Host:     host,
 			Path:     path,
 			RawQuery: query,
+		}
+	})
+}
+
+// Property: over the byte alphabet the live corpus contains, a URL-only key
+// equals the plain concatenation prefix/host/path[?QueryEscape(query)] — the
+// encoders are the identity there. If a Go upgrade changes an escape set,
+// this fails loudly instead of silently re-keying (and orphaning) the
+// corpus slice containing that byte.
+func TestS3PathForURLOnlyKeysCorpusStable(t *testing.T) {
+	cache := &s3HTTPCache{bucket: "test-bucket", prefix: "cache"}
+
+	rapid.Check(t, func(t *rapid.T) {
+		u := genURL().Draw(t, "url")
+
+		want := "cache/" + u.Host + u.Path
+		if u.RawQuery != "" {
+			want += "?" + url.QueryEscape(u.RawQuery)
+		}
+
+		if got := cache.s3PathFor(CacheKey{URL: u}); got != want {
+			t.Fatalf("s3PathFor(%v) = %q, want identity form %q", u, got, want)
 		}
 	})
 }
@@ -200,9 +227,9 @@ func TestS3PathForIncludesQuery(t *testing.T) {
 }
 
 // TestS3PathForDistinctResourcesGetDistinctKeys pins the key grammar's
-// injectivity on concrete collision pairs: each pair is two distinct
-// logical resources that previously shared one S3 key, where whichever
-// wrote last owned the object and served its bytes for both.
+// injectivity on concrete pairs: each pair is two distinct logical
+// resources whose keys must never meet — sharing one S3 object would let
+// whichever wrote last serve its bytes for both.
 func TestS3PathForDistinctResourcesGetDistinctKeys(t *testing.T) {
 	cache := &s3HTTPCache{bucket: "test-bucket", prefix: "cache"}
 
@@ -211,12 +238,12 @@ func TestS3PathForDistinctResourcesGetDistinctKeys(t *testing.T) {
 		a, b CacheKey
 	}{
 		{
-			name: "path embedding the variant separator vs a variant",
+			name: "double-slash path vs bare path with a variant",
 			a:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a//gif"}},
 			b:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a"}, Variant: "gif"},
 		},
 		{
-			name: "path embedding a percent-encoded variant vs a variant",
+			name: "path spelling an escaped variant vs a variant",
 			a:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a//text%2Fhtml"}},
 			b:    CacheKey{URL: &url.URL{Scheme: "https", Host: "example.com", Path: "/a"}, Variant: "text/html"},
 		},

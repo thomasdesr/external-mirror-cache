@@ -228,8 +228,11 @@ func (c *s3HTTPCache) Put(ctx context.Context, key CacheKey, headers http.Header
 // standard RFC 3986 path form — identity on real traffic, so keys read
 // exactly like the URLs they cache and the '/' hierarchy survives for
 // prefix listing. Without the escaping, a raw path could spell the
-// joiners itself: path "/a//gif" collided with path "/a" + variant "gif",
-// and path "/a?b" with path "/a" + query "b".
+// joiners itself: path "/a??gif" would collide with path "/a" + variant
+// "gif", and path "/a?b" with path "/a" + query "b" (paths arrive
+// decoded, so "%3F" produces a literal '?'). Assumes u.Path is empty or
+// starts with '/' — parseTargetURL always produces a leading slash — so
+// the host/path boundary cannot blur.
 func (c *s3HTTPCache) s3PathFor(key CacheKey) string {
 	u := key.URL
 

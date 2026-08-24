@@ -4,17 +4,19 @@ Status: hole 1 and the flap are fixed by Accept-variant cache keys on
 every path (docs/design-plans/2026-08-20-accept-variant-keys.md), which
 give negotiating URLs per-variant objects and per-variant singleflight
 groups. Hole 2 (the mutable-key redirect) is deliberately shelved: with
-variants keyed apart, the same-key overwrites that remain are
-byte-identical re-uploads (content-addressed registry paths whose
-upstreams provide no strong validator to match) and
-deliberately-rotating responses (auth tokens) — neither can hand a
-client wrong bytes — so version-pinned presigned URLs (the first fix
-direction below, validated in a prototype) are deliberately not in the
-tree rather than pay for bucket versioning, which would also store a
-full-size version per touch and per byte-identical re-upload. Its
-trigger: client wrong-bytes reports, or a content class whose bytes
-genuinely change under one key. Hole 3
-(upstream `Vary`-blind conditional
+variants keyed apart, no remaining same-key overwrite can hand a client
+another variant's bytes. What remains is byte-identical re-uploads
+(content-addressed registry paths whose upstreams provide no strong
+validator to match), deliberately-rotating responses (auth tokens), and
+genuine same-resource updates (an index page after a release) — a
+racing client gets the same resource, possibly a moment newer, which is
+the ordinary CDN experience. So version-pinned presigned URLs (the
+first fix direction below, validated in a prototype) are deliberately
+not in the tree rather than pay for bucket versioning, which would also
+store a full-size version per touch and per byte-identical re-upload.
+Its trigger: reports of a client receiving harmfully wrong bytes — a
+different resource or another client's variant, not merely a newer copy
+of what it asked for. Hole 3 (upstream `Vary`-blind conditional
 handling) remains accepted with no mechanism, per the trigger below.
 Originally captured 2026-08-18 after watching a `/simple/` index page's
 stored object alternate between its JSON and HTML representations under
@@ -74,25 +76,32 @@ served fresh, so the gate never freezes a flapped object.
   presigning the pre-touch version stays byte-identical. This also
   hardens the artifact path against any future overwrite race, not just
   Vary flapping.
-- **Per-variant keys via a protocol adapter** close holes 1 and 2 for
-  the negotiating URLs at the source: distinct variants become distinct
-  S3 objects and distinct singleflight groups, exactly as OCI manifests
-  work today. The right scope is a PyPI-simple adapter keying on the
-  spec-defined media types — the Accept values there are exact variant
-  names, not preference lists to interpret. Generic Vary-driven keying
-  is not a candidate: which request headers matter is response
-  knowledge, and up-front keying by Accept would rekey (and orphan) the
-  URL-only corpus while fragmenting non-negotiating URLs per client
-  Accept string.
+- **Per-variant keys** close hole 1 at the source: distinct variants
+  become distinct S3 objects and distinct singleflight groups. Shipped
+  as Accept-variant keys on every path; rationale, accepted costs, and
+  the normalization fallback (a per-protocol adapter mapping Accept
+  into a spec-defined representation enum, if per-URL Accept diversity
+  ever grows) live in
+  docs/design-plans/2026-08-20-accept-variant-keys.md.
 - **Hole 3 needs no mechanism** until an origin in the traffic actually
   exhibits it; the freshness touch already refuses validator-mismatched
   updates, which is the same class of defense on the metadata side.
 
 ## Trigger
 
-Act when either: wrong-variant reports (client parse errors on index
-pages correlating with mixed-Accept concurrency), or `/simple/`
-revalidation volume grows to matter — the adapter then fixes waste and
-correctness together. Version pinning can ride any unrelated
-storage-layer change earlier if versioning gets enabled for other
-reasons.
+For hole 2 (version pinning): reports of a client receiving harmfully
+wrong bytes, per the Status above. Version pinning can also ride any
+unrelated storage-layer change if bucket versioning gets enabled for
+other reasons.
+
+## Adjacent, accepted: encoded-slash collapse
+
+`parseTargetURL` builds the upstream URL from the decoded request path,
+so `%2F` collapses to `/` before the key or the fetch is formed: a
+request for a path containing an encoded slash silently maps to the
+resource at the slash-split path. This sits one layer above the key
+grammar (which is injective over what the parser hands it) and is
+unreachable in current traffic — no upstream in the mirror's host set
+uses `%2F` as a path literal. Fix shape if one appears (GitLab-style
+APIs are the known example): parse the target from the raw escaped path
+instead of the decoded one.

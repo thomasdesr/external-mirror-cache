@@ -36,7 +36,6 @@ type cacheMiddleware struct {
 	cache       httpCache
 	client      *http.Client
 	fallback    FallbackPolicy
-	keyFunc     func(target *url.URL, r *http.Request) (CacheKey, []string)
 	uploadGroup singleflight.Group[string] // dedupes concurrent requests, returns presigned URL
 
 	// honorFreshness enables the RFC 9111 freshness gate: cached entries
@@ -70,7 +69,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	accept := acceptHeader(r)
-	key, keyHeaders := m.buildKey(target, r)
+	key, keyHeaders := acceptVariantKeyFunc(target, r)
 
 	// Singleflight ensures only one request fetches from upstream.
 	// All callers (including leader) redirect to the cached content.
@@ -355,16 +354,6 @@ func (m *cacheMiddleware) presign(ctx context.Context, key CacheKey) (string, er
 	}
 
 	return u, nil
-}
-
-// buildKey returns the cache key plus the header names its variant encodes
-// (the freshness gate's Vary guard tolerates only those).
-func (m *cacheMiddleware) buildKey(target *url.URL, r *http.Request) (CacheKey, []string) {
-	if m.keyFunc != nil {
-		return m.keyFunc(target, r)
-	}
-
-	return CacheKey{URL: target}, nil
 }
 
 // acceptVariantKeyFunc builds a CacheKey whose variant is the request's

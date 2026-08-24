@@ -145,7 +145,6 @@ func run() error {
 			On5xx:             *staleOn5xx,
 			OnAnyError:        *staleOnAnyError,
 		},
-		keyFunc:        acceptVariantKeyFunc,
 		honorFreshness: honorFreshness,
 		freshnessCap:   freshnessCap,
 	}

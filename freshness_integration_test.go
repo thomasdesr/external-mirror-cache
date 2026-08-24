@@ -526,6 +526,59 @@ func TestFreshness_VaryAcceptVariantsServeFreshIndependently(t *testing.T) {
 	}
 }
 
+// TestFreshness_VariantEntryTouchRearms: a variant-keyed entry that ages
+// past its window revalidates once, touches, and serves fresh again — the
+// revalidation path must carry the variant's Accept claim into the touch
+// gate, or every Vary: Accept entry silently decays to per-request
+// revalidation after its first window.
+func TestFreshness_VariantEntryTouchRearms(t *testing.T) {
+	var upstreamHits atomic.Int32
+
+	upstream := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamHits.Add(1)
+
+		if r.Header.Get("If-None-Match") == testFreshETag {
+			w.WriteHeader(http.StatusNotModified)
+
+			return
+		}
+
+		w.Header().Set("Cache-Control", "max-age=600")
+		w.Header().Set("Vary", "Accept")
+		w.Header().Set("ETag", testFreshETag)
+		w.Write([]byte("index"))
+	}))
+	defer upstream.Close()
+
+	cache := newFakeCache()
+	proxy := newTestServerWithFreshness(upstream, cache, 7*24*time.Hour)
+
+	defer proxy.Close()
+
+	client := noRedirectClient()
+	target := proxy.URL + upstreamHostPath(upstream, "/simple/requests/")
+
+	const jsonAccept = "application/vnd.pypi.simple.v1+json"
+
+	variantKey := cachedURLFor(upstream, "/simple/requests/") + "\x00" + jsonAccept
+
+	mustGet303Accept(t, client, target, jsonAccept) // miss: fetch + cache
+
+	ageEntry(t, cache, variantKey, time.Hour) // past max-age=600
+
+	mustGet303Accept(t, client, target, jsonAccept) // stale: revalidates, 304 → touch
+
+	if calls := cache.touchCalls.Load(); calls != 1 {
+		t.Fatalf("touch calls = %d, want 1 (variant revalidation must re-arm the window)", calls)
+	}
+
+	mustGet303Accept(t, client, target, jsonAccept) // fresh under the re-armed window
+
+	if hits := upstreamHits.Load(); hits != 2 {
+		t.Errorf("upstream hits = %d, want 2 (re-armed variant entry must serve fresh)", hits)
+	}
+}
+
 // TestFreshness_MismatchedETagOn304SkipsTouch pins RFC 9111 §4.3.4's MUST
 // NOT: a 304 whose ETag doesn't strong-match the stored one (an IMS-only
 // revalidator answering for changed content) must not update the entry —

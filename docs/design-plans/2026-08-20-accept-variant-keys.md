@@ -53,9 +53,12 @@ Key by the raw Accept string, on every path.
 - **Accept-less requests keep URL-only keys and make no Accept-encoded
   claim.** URL-only keys are where the pre-variant corpus lives; entries
   stored there by clients that did send Accepts must not pass the
-  freshness Vary guard. Accepted cost: an Accept-less client on a
-  `Vary: Accept` host revalidates on every request, forever — correct,
-  just never fast; no known client omits Accept.
+  freshness Vary guard. Accepted cost, permanent: an Accept-less client
+  (Go's stdlib HTTP client sends no default Accept, so plain Go
+  fetchers qualify; the package tooling this mirror fronts all sends
+  one) on a `Vary: Accept` host revalidates on every request — never
+  fast, always correct. Revisit only if meaningful Accept-less traffic
+  ever appears on negotiating hosts.
 - **The S3 key grammar is injective, via stdlib encoders only.** A key
   is `prefix "/" PathEscape(host) EscapedPath ["?" QueryEscape(query)]
   ["??" PathEscape(variant)]`. Every encoder's output excludes a raw
@@ -67,10 +70,13 @@ Key by the raw Accept string, on every path.
   decoded, so `%3F` produces one) shared an object with the same path
   split at the `?` into path-plus-query — two distinct resources on one
   key, whichever wrote last serving its bytes for both. The encoders
-  are the identity on real hostnames and real paths, so keys stay
-  byte-identical to the corpus, read exactly like the URLs they cache,
-  and keep the `/` hierarchy for prefix listing; a URL's variant
-  objects sort beside their URL-only twin.
+  are the identity on real hostnames and on paths built from the bytes
+  package-artifact URLs use, so those keys stay byte-identical to the
+  corpus, read exactly like the URLs they cache, and keep the `/`
+  hierarchy for prefix listing; a URL's variant objects sort beside
+  their URL-only twin. A path carrying a byte outside that set (a
+  space, a literal `%`) re-keys once — duplicate storage, never wrong
+  bytes.
 
 ## Consequences
 
