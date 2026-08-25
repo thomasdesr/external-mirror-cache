@@ -545,7 +545,7 @@ func (t *ociAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			// Check if we got a 401 (token is stale)
 			if resp.StatusCode == http.StatusUnauthorized {
 				if req.Method == http.MethodGet || req.Method == http.MethodHead {
-					log.Printf("oci auth: stale token for %s/%s, re-discovering", host, repo)
+					log.Printf("oci auth: stale token for %q/%q, re-discovering", host, repo) //nolint:gosec // G706: %q-quoting escapes control chars
 					// Drain and close the 401 body to allow connection reuse
 					_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
 					_ = resp.Body.Close()
@@ -564,7 +564,7 @@ func (t *ociAuthTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 			return resp, nil
 		}
 
-		log.Printf("oci auth: token fetch failed for %s/%s: %v", host, repo, err)
+		log.Printf("oci auth: token fetch failed for %q/%q: %v", host, repo, err) //nolint:gosec // G706: %q-quoting escapes control chars
 		// Token fetch failed, fall through to discovery.
 		// Pass the failed challenge so discoveryPath can skip a redundant
 		// re-fetch if it discovers the same challenge parameters.
@@ -603,7 +603,8 @@ func (t *ociAuthTransport) discoveryPath(req *http.Request, host, repo string, f
 		return resp, nil
 	}
 
-	log.Printf("oci auth: discovered challenge for %s/%s (realm=%s)", host, repo, challenge.Realm)
+	//nolint:gosec // G706: %q-quoting escapes control chars
+	log.Printf("oci auth: discovered challenge for %q/%q (realm=%q)", host, repo, challenge.Realm)
 
 	// Store the challenge for future proactive requests
 	key := challengeKey(host, repo)
@@ -617,7 +618,8 @@ func (t *ociAuthTransport) discoveryPath(req *http.Request, host, repo string, f
 
 	// Skip re-fetching if the discovered challenge is identical to one that just failed
 	if failedChallenge != nil && challenge == *failedChallenge {
-		log.Printf("oci auth: skipping re-fetch for %s/%s (same challenge already failed)", host, repo)
+		//nolint:gosec // G706: %q-quoting escapes control chars
+		log.Printf("oci auth: skipping re-fetch for %q/%q (same challenge already failed)", host, repo)
 
 		return resp, nil
 	}
@@ -625,7 +627,7 @@ func (t *ociAuthTransport) discoveryPath(req *http.Request, host, repo string, f
 	// Try to fetch the token
 	token, err := t.fetcher.getOrFetch(req.Context(), challenge)
 	if err != nil {
-		log.Printf("oci auth: token fetch failed for %s/%s: %v", host, repo, err)
+		log.Printf("oci auth: token fetch failed for %q/%q: %v", host, repo, err) //nolint:gosec // G706: %q-quoting escapes control chars
 		// Token fetch failed, return the original 401
 		return resp, nil
 	}

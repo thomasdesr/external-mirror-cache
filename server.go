@@ -83,8 +83,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		logger := reqlog.FromContext(r.Context())
 		logger.Error("failed to fetch and cache", "target", target.String(), "error", err)
 
-		var ue *upstreamError
-		if errors.As(err, &ue) {
+		if ue, ok := errors.AsType[*upstreamError](err); ok {
 			http.Error(w, http.StatusText(ue.StatusCode), ue.StatusCode)
 		} else {
 			// Not http.StatusText(502): a relayed upstream 502 renders as
@@ -98,7 +97,7 @@ func (m *cacheMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	http.Redirect(w, r, presignedURL, http.StatusSeeOther)
+	http.Redirect(w, r, presignedURL, http.StatusSeeOther) //nolint:gosec // G710: redirect target is our own presigned URL
 }
 
 // fetchAndCache fetches from upstream and caches to S3, returning the presigned URL.
