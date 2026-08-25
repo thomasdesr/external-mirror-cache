@@ -74,7 +74,7 @@ func generateEtag(path string) (string, error) {
 
 func LoggingMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("Request received: %+v", r)
+		log.Printf("Request received: %q %q", r.Method, r.URL) //nolint:gosec // G706: %q-quoting escapes control chars
 		next.ServeHTTP(w, r)
 	})
 }

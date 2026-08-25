@@ -1210,7 +1210,7 @@ func TestIntegration_DockerHubAuthPath_ForwardsClientAuth(t *testing.T) {
 	t.Skip("proxy-level Authorization forwarding not yet implemented; OCI transport-level bypass tested in oci_auth_test.go (AC3.6)")
 
 	// Create a local token server so upstream challenge doesn't reference external URLs
-	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	tokenServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"token":"test-token","expires_in":3600}`))
 	}))
