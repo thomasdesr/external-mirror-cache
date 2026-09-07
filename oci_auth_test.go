@@ -978,7 +978,7 @@ func TestOCIAuthTransport_Discovery(t *testing.T) {
 
 		if calls == 1 {
 			// First call: bare request, return 401 with challenge
-			w.Header().Set("Www-Authenticate",
+			w.Header().Set("WWW-Authenticate",
 				`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:library/test:pull"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -1047,7 +1047,7 @@ func TestOCIAuthTransport_Proactive(t *testing.T) {
 
 		if calls == 1 {
 			// First request: bare, return 401
-			w.Header().Set("Www-Authenticate",
+			w.Header().Set("WWW-Authenticate",
 				`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:library/test:pull"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -1135,7 +1135,7 @@ func TestOCIAuthTransport_Refresh(t *testing.T) {
 
 		if calls == 1 {
 			// First request: bare, return 401
-			w.Header().Set("Www-Authenticate",
+			w.Header().Set("WWW-Authenticate",
 				`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:library/test:pull"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -1188,7 +1188,7 @@ func TestOCIAuthTransport_ResendStill401(t *testing.T) {
 	upstreamServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Always return 401 (token is invalid/revoked)
 		upstreamCalls.Add(1)
-		w.Header().Set("Www-Authenticate",
+		w.Header().Set("WWW-Authenticate",
 			`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:library/test:pull"`)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -1237,7 +1237,7 @@ func TestOCIAuthTransport_ExistingAuthBypass(t *testing.T) {
 		}
 
 		// Return 401 anyway (but it should pass through)
-		w.Header().Set("Www-Authenticate",
+		w.Header().Set("WWW-Authenticate",
 			`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:test:pull"`)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -1294,7 +1294,7 @@ func TestOCIAuthTransport_StaleTokenRediscovery(t *testing.T) {
 
 		if call == 1 {
 			// First request: bare, return 401
-			w.Header().Set("Www-Authenticate",
+			w.Header().Set("WWW-Authenticate",
 				`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:library/test:pull"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -1321,7 +1321,7 @@ func TestOCIAuthTransport_StaleTokenRediscovery(t *testing.T) {
 				t.Errorf("call 3: expected 'Bearer token-a', got %q", auth)
 			}
 			// Reject with challenge to trigger re-discovery
-			w.Header().Set("Www-Authenticate",
+			w.Header().Set("WWW-Authenticate",
 				`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:library/test:pull"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -1330,7 +1330,7 @@ func TestOCIAuthTransport_StaleTokenRediscovery(t *testing.T) {
 
 		if call == 4 {
 			// Fourth request: bare re-discovery, return 401 with challenge
-			w.Header().Set("Www-Authenticate",
+			w.Header().Set("WWW-Authenticate",
 				`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:library/test:pull"`)
 			w.WriteHeader(http.StatusUnauthorized)
 
@@ -1428,7 +1428,7 @@ func TestOCIAuthTransport_TokenFetchFailure(t *testing.T) {
 	defer tokenServer.Close()
 
 	upstreamServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Www-Authenticate",
+		w.Header().Set("WWW-Authenticate",
 			`Bearer realm="`+tokenServer.URL+`",service="registry.example.com",scope="repository:test:pull"`)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -1460,7 +1460,7 @@ func TestOCIAuthTransport_NonGETMethod(t *testing.T) {
 	upstreamServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		upstreamCalls.Add(1)
 
-		w.Header().Set("Www-Authenticate",
+		w.Header().Set("WWW-Authenticate",
 			`Bearer realm="https://localhost:8080/token",service="registry.example.com",scope="repository:test:pull"`)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -1508,7 +1508,7 @@ func TestOCIAuthTransport_ProactiveFailureNoDoubleFetch(t *testing.T) {
 	}
 
 	upstreamServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Www-Authenticate",
+		w.Header().Set("WWW-Authenticate",
 			`Bearer realm="`+tokenServer.URL+`",service="test-registry",scope="repository:library/test:pull"`)
 		w.WriteHeader(http.StatusUnauthorized)
 	}))
@@ -1577,7 +1577,7 @@ func TestOCIAuthTransport_DiscoveryNoService(t *testing.T) {
 
 		if calls == 1 {
 			// First call: bare request, return 401 with nvcr.io-style challenge (no service)
-			w.Header().Set("Www-Authenticate",
+			w.Header().Set("WWW-Authenticate",
 				`Bearer realm="`+tokenServer.URL+`",scope="repository:nvidia/k8s/dcgm-exporter:pull"`)
 			w.WriteHeader(http.StatusUnauthorized)
 

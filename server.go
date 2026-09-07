@@ -317,7 +317,7 @@ func (m *cacheMiddleware) maybeTouch(
 	// would relabel the old body with it and poison every future
 	// revalidation (the stale body would strong-match forever). A response
 	// with no ETag is safe: the merge retains the stored validators.
-	if vet := validating.Get("Etag"); vet != "" && !etagStrongMatch(entry.Headers.Get("Etag"), vet) {
+	if vet := validating.Get("ETag"); vet != "" && !etagStrongMatch(entry.Headers.Get("ETag"), vet) {
 		return
 	}
 

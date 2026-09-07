@@ -46,7 +46,7 @@ func TestInjectCacheHeaders_ETagAddsIfNoneMatch(t *testing.T) {
 		etag := genETag().Draw(t, "etag")
 
 		cachedHeaders := make(http.Header)
-		cachedHeaders.Set("etag", etag)
+		cachedHeaders.Set("ETag", etag)
 
 		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
@@ -81,7 +81,7 @@ func TestInjectCacheHeaders_BothHeadersInjected(t *testing.T) {
 		lastMod := genHTTPDate().Draw(t, "lastModified")
 
 		cachedHeaders := make(http.Header)
-		cachedHeaders.Set("etag", etag)
+		cachedHeaders.Set("ETag", etag)
 		cachedHeaders.Set("Last-Modified", lastMod)
 
 		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
@@ -106,10 +106,10 @@ func TestInjectCacheHeaders_SkipsIfRequestHasETagHeader(t *testing.T) {
 		existingETag := genETag().Draw(t, "existingETag")
 
 		cachedHeaders := make(http.Header)
-		cachedHeaders.Set("etag", cachedETag)
+		cachedHeaders.Set("ETag", cachedETag)
 
 		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
-		req.Header.Set("etag", existingETag)
+		req.Header.Set("ETag", existingETag)
 
 		injectCacheHeadersIntoRequest(req, cachedHeaders)
 
@@ -141,7 +141,7 @@ func TestInjectCacheHeaders_Idempotent(t *testing.T) {
 		lastMod := genHTTPDate().Draw(t, "lastModified")
 
 		cachedHeaders := make(http.Header)
-		cachedHeaders.Set("etag", etag)
+		cachedHeaders.Set("ETag", etag)
 		cachedHeaders.Set("Last-Modified", lastMod)
 
 		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
@@ -171,7 +171,7 @@ func TestInjectCacheHeaders_PreservesOtherHeaders(t *testing.T) {
 		otherHeaderValue := rapid.StringMatching(`[a-zA-Z0-9 /-]+`).Draw(t, "otherValue")
 
 		cachedHeaders := make(http.Header)
-		cachedHeaders.Set("etag", etag)
+		cachedHeaders.Set("ETag", etag)
 
 		req, _ := http.NewRequest(http.MethodGet, "http://example.com/file", nil)
 		req.Header.Set(otherHeaderKey, otherHeaderValue)

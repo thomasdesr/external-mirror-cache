@@ -34,7 +34,7 @@ func parseOCIAuthChallenge(resp *http.Response) (ociAuthChallenge, bool) {
 	}
 
 	// Get all WWW-Authenticate headers
-	headers := resp.Header.Values("Www-Authenticate")
+	headers := resp.Header.Values("WWW-Authenticate")
 
 	for _, header := range headers {
 		header = strings.TrimSpace(header)
