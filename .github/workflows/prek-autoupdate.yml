@@ -47,7 +47,7 @@ jobs:
           run: |
             curl --proto '=https' --tlsv1.2 -LsSf https://github.com/j178/prek/releases/latest/download/prek-installer.sh | sh
             export PATH="$HOME/.local/bin:$PATH"
-            prek auto-update --cooldown-days 7
+            prek update --cooldown-days 7
 
       - name: Open PR if hooks changed
         env:
@@ -67,6 +67,6 @@ jobs:
           if [ -z "$(gh pr list --head "$branch" --state open --json number --jq '.[].number')" ]; then
             gh pr create --base main --head "$branch" \
               --title "build(deps): update prek hook revisions" \
-              --body "Automated \`prek auto-update --cooldown-days 7\` run. Bumps pinned hook revisions in \`prek.toml\` published at least 7 days ago." \
+              --body "Automated \`prek update --cooldown-days 7\` run. Bumps pinned hook revisions in \`prek.toml\` published at least 7 days ago." \
               --label dependencies
           fi
