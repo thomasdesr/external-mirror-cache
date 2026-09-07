@@ -10,8 +10,8 @@ import (
 // Significantly simplified version of the logic from here:
 // https://github.com/gregjones/httpcache/blob/901d90724c7919163f472a9812253fb26761123d/httpcache.go#L168-L184
 func injectCacheHeadersIntoRequest(req *http.Request, cachedHeaders http.Header) {
-	etag := cachedHeaders.Get("etag")
-	if etag != "" && req.Header.Get("etag") == "" {
+	etag := cachedHeaders.Get("ETag")
+	if etag != "" && req.Header.Get("ETag") == "" {
 		req.Header.Set("If-None-Match", etag)
 	}
 
