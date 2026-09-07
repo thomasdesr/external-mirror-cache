@@ -50,5 +50,5 @@ priority = 100
 
 [[repos]]
 repo = "https://github.com/zizmorcore/zizmor-pre-commit"
-rev = "v1.22.0"
+rev = "v1.30.0"
 hooks = [{ id = "zizmor", args = ["--pedantic"] }]
