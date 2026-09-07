@@ -34,7 +34,7 @@ priority = 100
 
 [[repos]]
 repo = "https://github.com/golangci/golangci-lint"
-rev = "v2.13.1"
+rev = "v2.13.2"
 
 [[repos.hooks]]
 id = "golangci-lint"
