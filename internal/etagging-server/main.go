@@ -8,8 +8,9 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"path/filepath"
+	"path"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/thomasdesr/external-mirror-cache/internal/errorutil"
@@ -18,10 +19,15 @@ import (
 const bindAddress = "localhost:8000"
 
 func main() {
+	root, err := os.OpenRoot(".")
+	if err != nil {
+		panic(err)
+	}
+
 	// Create our server
 	server := &http.Server{
 		Addr:         bindAddress,
-		Handler:      LoggingMiddleware(withEtag(http.FileServer(http.Dir(".")))),
+		Handler:      LoggingMiddleware(withEtag(root, http.FileServer(http.Dir(".")))),
 		ReadTimeout:  5 * time.Second,
 		WriteTimeout: 10 * time.Second,
 	}
@@ -29,18 +35,18 @@ func main() {
 	// Start server
 	log.Printf("Listening on %s", bindAddress)
 
-	err := server.ListenAndServeTLS("localhost.dev.pem", "localhost.dev-key.pem") // Certs generated using mkcert usually
+	err = server.ListenAndServeTLS("localhost.dev.pem", "localhost.dev-key.pem") // Certs generated using mkcert usually
 	if err != nil {
 		panic(err)
 	}
 }
 
-func withEtag(next http.Handler) http.Handler {
+func withEtag(root *os.Root, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Generate an Etag for the requested file
 		switch r.Method {
 		case http.MethodHead, http.MethodGet:
-			etag, err := generateEtag(r.URL.Path)
+			etag, err := generateEtag(root, r.URL.Path)
 			if err == nil {
 				w.Header().Set("Etag", strconv.Quote(etag))
 			}
@@ -50,17 +56,17 @@ func withEtag(next http.Handler) http.Handler {
 	})
 }
 
-// generateEtag reads the file at the given path and generates an Etag for it
-// based on stuffs.
-func generateEtag(path string) (string, error) {
-	absPath, err := filepath.Abs("./" + path)
-	if err != nil {
-		return "", errorutil.Wrapf(err, "abs path %s", path)
+// generateEtag stats the file at urlPath within root and generates an Etag for
+// it based on stuffs. root rejects paths that escape the served directory.
+func generateEtag(root *os.Root, urlPath string) (string, error) {
+	name := strings.TrimPrefix(path.Clean("/"+urlPath), "/")
+	if name == "" {
+		name = "."
 	}
 
-	fileInfo, err := os.Stat(absPath)
+	fileInfo, err := root.Stat(name)
 	if err != nil {
-		return "", errorutil.Wrapf(err, "stat %s", absPath)
+		return "", errorutil.Wrapf(err, "stat %s", name)
 	}
 
 	etagBytes := make([]byte, 0, binary.MaxVarintLen64*2)
